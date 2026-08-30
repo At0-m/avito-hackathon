@@ -1,45 +1,33 @@
 # API и модель данных
 
-## Контракт
+Канонический контракт находится в `docs/openapi.yaml`.
 
-Канонический API-контракт — `docs/openapi.yaml` (OpenAPI 3.0.3).
-
-Backend принимает пользователя и год, синхронно формирует recap один раз и
-возвращает готовый неизменяемый snapshot. Повторный `POST /recaps` для той же
-пары пользователь–год возвращает сохранённый результат без пересчёта.
-
-## Endpoint
+## API
 
 | Метод и путь | Назначение | Результат |
 |---|---|---|
-| `GET /profiles` | Пользователи с доступными годами | `Profile[]` |
-| `GET /profiles/{id}` | Один пользователь | `Profile` |
-| `POST /recaps` | Однократно сформировать итог | `201 Recap` или `200 Recap` |
-| `GET /recaps/{id}` | Получить сохранённый итог | `Recap` |
-| `GET /recaps/{id}/explanation` | Объяснить выборы | `RecapExplanation` |
-| `GET /recaps/{id}/share` | Получить публичную проекцию | `ShareCard` |
-| `POST /recaps/{id}/interactions` | Записать продуктовое событие | `InteractionResponse` |
+| `GET /profiles` | Список профилей и доступных годов | `Profile[]` |
+| `GET /profiles/{id}` | Один профиль | `Profile` |
+| `POST /recaps` | Создать задачу или вернуть готовый recap | `202 RecapRequestStatus` или `200 Recap` |
+| `GET /recaps/{id}` | Состояние задачи или готовый recap | `RecapRequestStatus` или `Recap` |
+| `GET /recaps/{id}/stream` | Прогресс через SSE | `status / ready / failed` |
+| `GET /recaps/{id}/explanation` | Объяснение роли, стиля и достижений | `RecapExplanation` |
+| `GET /recaps/{id}/share` | Публичная проекция | `ShareCard` |
+| `POST /recaps/{id}/interactions` | Продуктовое событие | `InteractionResponse` |
 
-Список пользователей возвращается обычным массивом `Profile[]`. Статусы фоновой
-генерации и polling отсутствуют: они не соответствуют синхронной однократной генерации.
+Готовый recap неизменяем. Повторный запрос для той же пары профиля, года и версии алгоритма возвращает существующую задачу или сохранённый результат.
 
 ## Хранение
 
-- PostgreSQL: пользователи, справочники, recap, суммаризация, карточки, метрики,
-  архетип, достижения, объяснения и share-card.
-- ClickHouse: исходная активность и продуктовые interaction events.
+- PostgreSQL: профили, справочники, задачи, outbox/inbox, snapshots, объяснения и публичные карточки;
+- ClickHouse: активность и interaction events;
+- Redpanda: внутренние команды worker и события жизненного цикла.
 
-Один итог на год гарантируют транзакционная advisory-блокировка backend и
-`recaps UNIQUE (user_id, year)`. Composite FK разрешает генерацию только за год
-из `user_available_years`. Суммаризация сохраняется в `recaps.summary_title` и
-`recaps.summary_text`.
-
-Вертикали, категории, метрики, роли, стили и достижения задаются справочниками.
-Малые закрытые множества задаются enum в PostgreSQL, ClickHouse и OpenAPI.
+Задача и команда outbox создаются одной транзакцией. Готовый snapshot и статус `ready` также сохраняются одной транзакцией.
 
 ## Карточки
 
-`RecapCard` — discriminated union по обязательному полю `type`:
+`RecapCard` различается по полю `type`:
 
 - `intro`;
 - `metric`;
@@ -51,6 +39,12 @@ Backend принимает пользователя и год, синхронн�
 
 ## Ошибки
 
-Единый формат — `APIError`. Поддерживаются коды `invalid_argument`,
-`profile_not_found`, `recap_not_found`, `insufficient_activity`,
-`rate_limit_exceeded`, `dependency_unavailable`, `internal_error`.
+Единый формат ответа — `APIError`. Основные коды:
+
+- `invalid_argument`;
+- `profile_not_found`;
+- `recap_not_found`;
+- `insufficient_activity`;
+- `rate_limit_exceeded`;
+- `dependency_unavailable`;
+- `internal_error`.

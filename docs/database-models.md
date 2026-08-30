@@ -1,84 +1,81 @@
 # Модели данных PostgreSQL и ClickHouse
 
-SQL-миграции в `backend/migrations` — канонический источник схемы.
+Каноническая схема находится в SQL-миграциях `backend/migrations`.
 
-## Граница хранилищ
+## Разделение хранилищ
 
-- PostgreSQL хранит пользователей, справочники и однажды сформированный неизменяемый recap.
-- ClickHouse хранит только исходные действия и продуктовые события просмотра recap.
-- `UNIQUE (user_id, year)` в PostgreSQL гарантирует один recap на пользователя и год.
-- Composite FK `(user_id, year)` разрешает генерацию только для доступного пользователю года.
-- Ссылки из ClickHouse на PostgreSQL логические; их проверяет приложение.
+- PostgreSQL хранит профили, состояние генерации, outbox/inbox и готовые snapshots;
+- ClickHouse хранит события активности и продуктовые interaction events;
+- Redpanda передаёт команды и события, но не является источником состояния;
+- связи между ClickHouse и PostgreSQL проверяет приложение.
 
-Актуальная ER-диаграмма находится в `docs/database.dbml`.
+ER-диаграмма основного MVP находится в `docs/database.dbml`. Асинхронные таблицы добавлены миграциями `003_recap_requests.sql` и `004_eventing.sql`.
 
 ## PostgreSQL
 
-### Пользователи
+### Профили и справочники
 
-- `users` — имя, описание и аватар пользователя.
-- `user_available_years` — множество годов, за которые пользователю доступны итоги.
+- `profiles` — имя, описание, аватар и сценарий;
+- `profile_available_years` — доступные годы;
+- `verticals`, `categories`, `metric_definitions` — таксономия и метрики;
+- `archetype_roles`, `archetype_styles`, `achievement_definitions` — варианты персонализации.
 
-Происхождение данных не влияет на доменную модель пользователя.
+### Задачи генерации
 
-### Справочники
+`recap_requests` хранит:
 
-Коды, которые определяют тип или категорию, не хранятся произвольным текстом:
+- статус `queued / processing / ready / failed`;
+- этап и процент выполнения;
+- число попыток и время следующего запуска;
+- владельца задачи и lease;
+- ссылку на готовый recap;
+- безопасный код ошибки и признак возможности повтора.
 
-- `verticals` — вертикали Авито;
-- `categories` — категории, каждая принадлежит одной вертикали;
-- `metric_definitions` — поддерживаемые расчётные метрики и их единицы;
-- `archetype_roles` и `archetype_styles` — допустимые части архетипа;
-- `achievement_definitions` — допустимые достижения.
+Уникальность `(profile_id, year, algorithm_version)` не позволяет создать две одинаковые задачи. Workers используют `FOR UPDATE SKIP LOCKED`. Изменять задачу в `processing` может только её текущий владелец.
 
-Для небольших стабильных множеств используются PostgreSQL enum: тип и видимость
-карточки, вид визуала, уровень достижения, источник текста, тип решения,
-оператор сравнения и тип публичного факта.
+### Outbox и inbox
 
-### Сформированные итоги
+`outbox_events` содержит команды, созданные в одной транзакции с `recap_request`. Publisher забирает записи по lease, повторяет отправку при ошибке и после успеха переводит запись в `published`.
 
-`recaps` — корень неизменяемого snapshot. Помимо идентификаторов и версий в нём
-явно сохраняются сгенерированные `summary_title` и `summary_text`, метаданные
-генерации и выбранная главная вертикаль.
+`consumed_events` хранит обработанные `command_id`. Первичный ключ `(consumer_name, event_id)` защищает от повторной доставки внутри группы consumers.
 
-Backend должен брать транзакционную advisory-блокировку по паре пользователь–год
-перед расчётом. Вместе с unique constraint это исключает параллельный двойной расчёт.
+Опубликованные записи outbox остаются в базе для диагностики. Их очистку можно добавить отдельной retention-задачей.
 
-Дочерние данные:
+### Готовый recap
 
-- `recap_cards` — упорядоченные presentation-карточки;
-- `recap_metrics` — рассчитанные значения из `metric_definitions`;
-- `recap_archetypes` — выбранные роль и стиль;
-- `recap_achievements` — до трёх главных достижений;
-- `recap_explanations` и `recap_rule_facts` — объяснения решений;
-- `share_cards`, `share_facts`, `share_achievements` — безопасная публичная проекция.
+`recaps` — корневая таблица результата. Уникальность `(profile_id, year)` не допускает второй snapshot для той же пары. Одной транзакцией сохраняются:
 
-`recap_cards.data` остаётся JSONB только для специфичных данных разных типов
-карточек. Поля, по которым выполняются связи, фильтрация или проверка множества,
-вынесены в типизированные таблицы и колонки.
+- `recap_cards`;
+- `recap_metrics`;
+- `recap_archetypes`;
+- `recap_achievements`;
+- `recap_explanations` и `recap_rule_facts`;
+- `share_cards`, `share_facts`, `share_achievements`;
+- переход соответствующей задачи в `ready`.
+
+`recap_cards.data` используется только для данных, зависящих от типа карточки. Поля для связей и ограничений вынесены в отдельные колонки и таблицы.
 
 ## ClickHouse
 
 ### `activity_events`
 
-- Engine: `MergeTree`.
-- Partition key: `toYYYYMM(occurred_at)`.
-- Sorting key: `(profile_id, occurred_at, event_type, event_id)`.
-- `event_type`, `vertical_code` и `category_code` ограничены ClickHouse enum.
-- `profile_id` логически ссылается на `PostgreSQL.users.id`.
+- движок: `ReplacingMergeTree(received_at)`;
+- partition key: `toYear(occurred_at)`;
+- sorting key: `(profile_id, event_id)`;
+- более поздняя версия события заменяет предыдущую запись с тем же `profile_id + event_id`;
+- worker выбирает события профиля в границах указанного года.
 
 ### `interactions`
 
-- Engine: `MergeTree`.
-- Partition key: `toYYYYMM(occurred_at)`.
-- Sorting key: `(recap_id, occurred_at, event_name, event_id)`.
-- `event_name` ограничен ClickHouse enum.
-- `recap_id` логически ссылается на `PostgreSQL.recaps.id`.
+- движок: `ReplacingMergeTree(received_at)`;
+- partition key: `toYYYYMM(occurred_at)`;
+- sorting key: `(recap_id, event_id)`;
+- повторный `event_id` не создаёт второе логическое событие.
 
 ## Изменение схемы
 
-1. Для применённых окружений добавлять новую нумерованную миграцию.
-2. Вместе с миграцией обновлять `docs/database.dbml`, этот документ и OpenAPI,
-   если меняется публичный контракт.
-3. Новые типы и категории сначала добавлять в соответствующий справочник или enum.
-4. Не переносить готовый recap в ClickHouse: это транзакционная сущность PostgreSQL.
+1. Добавлять новую нумерованную миграцию, не переписывая уже применённые.
+2. При изменении контракта обновлять DBML, OpenAPI и документацию.
+3. Проверять ограничения состояния и владельца интеграционными тестами.
+4. Не переносить состояние задачи и готовый recap в ClickHouse или Redpanda.
+5. При росте объёма добавить правила очистки `outbox_events` и `consumed_events`.
