@@ -64,14 +64,18 @@ export function streamRecapUntilReady(
         if (!isRecapDTO(value)) throw new StreamUnavailableError();
         finish(() => resolve(value));
       } catch (cause) {
-        finish(() => reject(cause));
+        finish(() =>
+          reject(cause instanceof Error ? cause : new StreamUnavailableError()),
+        );
       }
     };
     const onFailed = (event: MessageEvent<string>) => {
       try {
         const value = parse(event);
         if (isRecapDTO(value)) throw new StreamUnavailableError();
+
         options.onProgress?.(value);
+
         finish(() =>
           reject(
             new GenerationFailedError(
@@ -82,7 +86,9 @@ export function streamRecapUntilReady(
           ),
         );
       } catch (cause) {
-        finish(() => reject(cause));
+        finish(() =>
+          reject(cause instanceof Error ? cause : new StreamUnavailableError()),
+        );
       }
     };
     const onAbort = () =>
