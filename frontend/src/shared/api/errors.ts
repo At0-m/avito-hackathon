@@ -1,13 +1,9 @@
-import { APIError, NetworkError } from './client.ts';
+import { APIError, NetworkError } from './client';
+import { GenerationFailedError } from './polling';
 
-/**
- * Человеческое описание сбоя. Технический текст бэкенда пользователю не
- * показываем — только понятную причину и то, что с ней делать.
- */
 export interface FailureView {
   title: string;
   hint?: string;
-  /** Имеет ли смысл повторить тот же запрос. */
   retryable: boolean;
 }
 
@@ -66,6 +62,15 @@ export function describeFailure(error: unknown): FailureView {
         retryable: true,
       }
     );
+  }
+
+  if (error instanceof GenerationFailedError) {
+    const view = BY_CODE[error.code] ?? {
+      title: 'Не удалось собрать итоги',
+      hint: 'Попробуй повторить генерацию.',
+      retryable: error.retryable,
+    };
+    return { ...view, retryable: error.retryable };
   }
 
   if (error instanceof NetworkError) {

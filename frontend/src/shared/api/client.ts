@@ -1,19 +1,13 @@
-import { endpoints } from './api.ts';
+import { endpoints } from './api';
 import type {
   APIErrorCode,
   APIErrorDTO,
   ProfileDTO,
-  RecapDTO,
   RecapExplanationDTO,
+  RecapResponseDTO,
   ShareCardDTO,
-} from './dto.ts';
+} from './dto';
 
-/**
- * HTTP-слой. Ничего не знает про экраны: отдаёт DTO как есть
- * и превращает ответ бэкенда об ошибке в типизированное исключение.
- */
-
-/** Ошибка бэкенда в его формате. `code` — то, по чему ветвится UI. */
 export class APIError extends Error {
   readonly code: APIErrorCode;
   readonly status: number;
@@ -28,7 +22,6 @@ export class APIError extends Error {
   }
 }
 
-/** Сеть недоступна или ответ нечитаем — это не ошибка бизнес-логики. */
 export class NetworkError extends Error {
   constructor(cause: unknown) {
     super('Сервис недоступен');
@@ -45,6 +38,7 @@ async function request<T>(url: string, init?: RequestInit): Promise<T> {
       headers: { 'Content-Type': 'application/json', ...init?.headers },
     });
   } catch (cause) {
+    if (cause instanceof DOMException && cause.name === 'AbortError') throw cause;
     throw new NetworkError(cause);
   }
 
@@ -64,19 +58,20 @@ export function getProfiles(): Promise<ProfileDTO[]> {
   return request<ProfileDTO[]>(endpoints.profiles());
 }
 
-/**
- * Формирует итоги. Бэкенд отвечает 201 при первом вызове и 200, если snapshot
- * уже существует, — оба статуса успешные и тело у них одинаковое.
- */
-export function createRecap(profileId: string, year: number): Promise<RecapDTO> {
-  return request<RecapDTO>(endpoints.recaps(), {
+export function createRecap(
+  profileId: string,
+  year: number,
+  signal?: AbortSignal,
+): Promise<RecapResponseDTO> {
+  return request<RecapResponseDTO>(endpoints.recaps(), {
     method: 'POST',
     body: JSON.stringify({ profile_id: profileId, year }),
+    signal,
   });
 }
 
-export function getRecap(recapId: string): Promise<RecapDTO> {
-  return request<RecapDTO>(endpoints.recap(recapId));
+export function getRecap(recapId: string, signal?: AbortSignal): Promise<RecapResponseDTO> {
+  return request<RecapResponseDTO>(endpoints.recap(recapId), { signal });
 }
 
 export function getExplanation(recapId: string): Promise<RecapExplanationDTO> {

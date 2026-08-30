@@ -1,9 +1,3 @@
-/**
- * Типы ответов бэкенда — один в один по docs/openapi.yaml.
- * Здесь ничего не адаптируется под UI: это сырой контракт.
- * Приведение к модели экранов живёт в adapter.ts.
- */
-
 export type VerticalCode = 'goods' | 'transport' | 'real_estate' | 'jobs' | 'services';
 
 export type CategoryCode =
@@ -132,7 +126,6 @@ export interface DistrictCardDTO extends BaseCardDTO {
   type: 'district';
   data: {
     vertical: VerticalDTO;
-    /** Доля главной вертикали в году, 0..1. Считается по весам событий. */
     activity_share: number;
     top_category?: CategoryDTO;
   };
@@ -183,7 +176,6 @@ export interface RecapDTO {
   generation: {
     algorithm_version: string;
     feature_schema_version: string;
-    /** `sha256:...`, детерминирован для набора активности. Используем как сид города. */
     activity_hash: string;
     generated_at: string;
     narrative: { source: 'mistral' | 'template'; prompt_version: string; model?: string | null };
@@ -195,6 +187,28 @@ export interface RecapDTO {
     explanation_available: boolean;
     feedback_available: boolean;
   };
+}
+
+export type RecapRequestState = 'queued' | 'processing' | 'ready' | 'failed';
+
+export interface RecapRequestStatusDTO {
+  id: string;
+  profile_id: string;
+  year: number;
+  status: RecapRequestState;
+  stage: string;
+  progress_percent: number;
+  attempt: number;
+  max_attempts: number;
+  poll_after_ms: number;
+  links: { self: string; stream?: string };
+  error?: { code: string; message: string; retryable: boolean };
+}
+
+export type RecapResponseDTO = RecapDTO | RecapRequestStatusDTO;
+
+export function isRecapDTO(value: RecapResponseDTO): value is RecapDTO {
+  return 'schema_version' in value && 'cards' in value;
 }
 
 export interface RuleFactDTO {

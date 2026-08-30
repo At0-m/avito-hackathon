@@ -23,26 +23,28 @@ export function RecapPage() {
   const [step, setStep] = useState(0);
   const [focus, setFocus] = useState<DistrictId | null>(null);
   const [shareOpen, setShareOpen] = useState(false);
-  // Ref, а не state: защёлка «для какого recap уже запросили обоснования».
   const explained = useRef<string | null>(null);
 
-  // Прямая ссылка на итоги: snapshot неизменяем, поэтому просто перечитываем его.
   useEffect(() => {
     if (recap) return;
     let active = true;
+    const controller = new AbortController();
 
-    loadRecap(recapId)
+    void loadRecap(recapId, controller.signal)
       .then((value) => {
         if (!active) return;
         cacheRecap(value);
         setRecap(value);
       })
       .catch((cause: unknown) => {
-        if (active) setFailure(describeFailure(cause));
+        if (!active) return;
+        if (cause instanceof DOMException && cause.name === 'AbortError') return;
+        setFailure(describeFailure(cause));
       });
 
     return () => {
       active = false;
+      controller.abort();
     };
   }, [recap, recapId]);
 
@@ -64,14 +66,6 @@ export function RecapPage() {
     return () => window.removeEventListener('keydown', onKey);
   }, [back, next]);
 
-  /**
-   * Обоснования — отдельный запрос. Тянем один раз сразу после recap: они нужны
-   * уже на главе с ролью, а не только на финале.
-   *
-   * Защёлка по recapId, а не флаг + отмена в cleanup: в StrictMode эффект
-   * вызывается дважды, и отмена по cleanup выбросила бы единственный ответ.
-   * Применить результат к размонтированному компоненту безопасно.
-   */
   useEffect(() => {
     if (!recap || !recap.capabilities.explanationAvailable) return;
     if (explained.current === recap.recapId) return;
@@ -85,10 +79,6 @@ export function RecapPage() {
       .catch(() => undefined);
   }, [recap]);
 
-  /**
-   * До главы про район город показан только главным кварталом, с неё —
-   * целиком: именно там бэкенд впервые сообщает долю, то есть размер остального.
-   */
   const revealed = useMemo(() => {
     if (!recap) return new Set<DistrictId>();
     const districtStep = recap.chapters.findIndex((item) => item.kind === 'district');
@@ -128,7 +118,6 @@ export function RecapPage() {
   }
 
   const chapter = recap.chapters[step];
-  // Обоснования показываем, только если бэкенд их разрешил и реально прислал.
   const hasReasons =
     recap.capabilities.explanationAvailable &&
     Boolean(recap.role.reason ?? recap.style.reason);
@@ -150,7 +139,7 @@ export function RecapPage() {
         </ol>
 
         <div className="recap__header-actions">
-          {/* Кнопку прячем по capabilities, а не ловим 409 после клика. */}
+          {}
           {isFinal && recap.capabilities.shareAvailable && (
             <button type="button" className="btn btn--ghost" onClick={() => setShareOpen(true)}>
               Поделиться городом
@@ -174,12 +163,10 @@ export function RecapPage() {
                   `${recap.totals.activeDays} активных дней · `}
                 {pluralize(recap.totals.districts, DISTRICTS)}
               </p>
-              {/* Главный персональный итог: ровно то, что написал бэкенд. */}
+              {}
               {recap.summaryText && <p className="recap__summary">{recap.summaryText}</p>}
             </>
           ) : chapter.kind === 'archetype' ? (
-            /* У роли своя вёрстка: общий шаблон главы разваливал экран на
-               несвязанные строки, а стиль дублировался в описании карточки. */
             <div className="archetype">
               {chapter.eyebrow && <p className="archetype__eyebrow">{chapter.eyebrow}</p>}
               <h1 className="recap__chapter-title">{recap.role.title}</h1>
@@ -220,7 +207,7 @@ export function RecapPage() {
                 </p>
               )}
 
-              {/* Все звания из карточки, а не только первое. */}
+              {}
               {chapter.kind === 'achievements' && recap.badges.length > 0 && (
                 <ul className="recap__awards">
                   {recap.badges.map((badge) => (
@@ -273,7 +260,7 @@ export function RecapPage() {
           <div className="recap__panels">
             <TraitsPanel role={recap.role} style={recap.style} />
             <BadgesPanel badges={recap.badges} />
-            {/* Панель появится, когда бэкенд начнёт отдавать незавершённые сценарии. */}
+            {}
             {recap.unfinished.length > 0 && <UnfinishedPanel items={recap.unfinished} />}
           </div>
 
