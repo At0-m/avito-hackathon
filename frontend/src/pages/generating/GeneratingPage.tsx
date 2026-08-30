@@ -1,14 +1,10 @@
 import { useEffect, useState } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
-import { generateRecap } from '@/shared/api/recap';
+import { generateRecap, type GenerationProgress } from '@/shared/api/recap';
 import { describeFailure, type FailureView } from '@/shared/api/errors';
 import { cacheRecap } from '@/shared/api/cache';
 import './GeneratingPage.css';
 
-/**
- * Шаги проговаривают, что именно система посчитала важным. Это требование ТЗ
- * («какие действия система посчитала важными») закрыто ещё до первого экрана итогов.
- */
 const STEPS = [
   'Читаем действия за год',
   'Раскладываем их по районам',
@@ -17,47 +13,63 @@ const STEPS = [
   'Строим город',
 ] as const;
 
-const STEP_MS = 420;
-/** Минимальный показ анимации, чтобы сборка не мигала, если бэкенд ответил мгновенно. */
-const MIN_VISIBLE_MS = STEP_MS * STEPS.length;
+const MIN_VISIBLE_MS = 900;
+
+const STAGE_TO_STEP: Record<string, number> = {
+  queued: 0,
+  starting: 0,
+  loading_activity: 0,
+  computing_features: 1,
+  personalizing: 3,
+  generating_narrative: 3,
+  persisting_snapshot: 4,
+  ready: 4,
+};
 
 export function GeneratingPage() {
   const { profileId = '', year = '' } = useParams();
   const navigate = useNavigate();
   const [step, setStep] = useState(0);
+  const [progress, setProgress] = useState(0);
   const [failure, setFailure] = useState<FailureView | null>(null);
 
   useEffect(() => {
     let active = true;
-
-    const ticker = setInterval(() => {
-      setStep((current) => Math.min(current + 1, STEPS.length - 1));
-    }, STEP_MS);
-
-    // Запрос уходит сразу; ждём только оставшуюся часть минимального показа.
+    const controller = new AbortController();
     const startedAt = Date.now();
+
     const holdRemaining = () =>
       new Promise<void>((resolve) =>
-        setTimeout(resolve, Math.max(0, MIN_VISIBLE_MS - (Date.now() - startedAt))),
+        window.setTimeout(resolve, Math.max(0, MIN_VISIBLE_MS - (Date.now() - startedAt))),
       );
 
-    generateRecap(profileId, Number(year))
+    const onProgress = (status: GenerationProgress) => {
+      if (!active) return;
+      const boundedProgress = Math.max(0, Math.min(100, status.progress_percent));
+      const stageStep =
+        STAGE_TO_STEP[status.stage] ?? Math.min(Math.floor(boundedProgress / 20), STEPS.length - 1);
+      setStep((current) => Math.max(current, stageStep));
+      setProgress((current) => Math.max(current, boundedProgress));
+    };
+
+    void generateRecap(profileId, Number(year), onProgress, controller.signal)
       .then(async (recap) => {
         await holdRemaining();
         if (!active) return;
+        setStep(STEPS.length - 1);
+        setProgress(100);
         cacheRecap(recap);
         void navigate(`/recap/${recap.recapId}`, { replace: true });
       })
       .catch((cause: unknown) => {
         if (!active) return;
-        // 422 — не сбой, а штатный ответ: за год слишком мало значимых действий.
+        if (cause instanceof DOMException && cause.name === 'AbortError') return;
         setFailure(describeFailure(cause));
-      })
-      .finally(() => clearInterval(ticker));
+      });
 
     return () => {
       active = false;
-      clearInterval(ticker);
+      controller.abort();
     };
   }, [navigate, profileId, year]);
 
@@ -91,6 +103,8 @@ export function GeneratingPage() {
     );
   }
 
+  const visibleProgress = Math.max(progress, ((step + 1) / STEPS.length) * 100);
+
   return (
     <main className="generating">
       <div className="generating__inner">
@@ -113,11 +127,8 @@ export function GeneratingPage() {
           ))}
         </ol>
 
-        <div className="generating__bar">
-          <div
-            className="generating__fill"
-            style={{ width: `${((step + 1) / STEPS.length) * 100}%` }}
-          />
+        <div className="generating__bar" aria-label={`Готово на ${Math.round(visibleProgress)}%`}>
+          <div className="generating__fill" style={{ width: `${visibleProgress}%` }} />
         </div>
       </div>
     </main>

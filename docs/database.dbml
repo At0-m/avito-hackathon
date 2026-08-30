@@ -309,6 +309,5 @@ Ref: postgres.share_facts.recap_id > postgres.share_cards.recap_id [delete: casc
 Ref: postgres.share_achievements.recap_id > postgres.share_cards.recap_id [delete: cascade]
 Ref: postgres.share_achievements.(recap_id, achievement_code) > postgres.recap_achievements.(recap_id, achievement_code) [delete: cascade]
 
-// Logical cross-database references.
 Ref: avito_recap.activity_events.profile_id > postgres.users.id
 Ref: avito_recap.interactions.recap_id > postgres.recaps.id

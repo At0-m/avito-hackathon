@@ -1,33 +1,72 @@
-import { adaptProfiles, adaptRecap, applyExplanation } from './adapter.ts';
-import { createRecap, getExplanation, getProfiles, getRecap, getShareCard } from './client.ts';
-import type { ShareCardDTO } from './dto.ts';
-import type { Profile, Recap } from '../types/recap.ts';
+import { adaptProfiles, adaptRecap, applyExplanation } from './adapter';
+import { createRecap, getExplanation, getProfiles, getRecap, getShareCard } from './client';
+import { isRecapDTO, type RecapRequestStatusDTO, type ShareCardDTO } from './dto';
+import { GenerationFailedError, pollRecapUntilReady } from './polling';
+import { StreamUnavailableError, streamRecapUntilReady } from './streaming';
+import type { Profile, Recap } from '@/shared/types/recap';
 
-/**
- * Прикладной слой: страницы ходят сюда и получают уже модель экранов.
- * Про HTTP и DTO знают client.ts и adapter.ts, компоненты — нет.
- */
+export type GenerationProgress = RecapRequestStatusDTO;
+export type ProgressListener = (status: GenerationProgress) => void;
 
 export function fetchProfiles(): Promise<Profile[]> {
   return getProfiles().then(adaptProfiles);
 }
 
-/**
- * Собирает итоги. Повторный вызов для той же пары профиль–год бэкенд
- * не пересчитывает: возвращает тот же snapshot с 200 вместо 201.
- */
-export function generateRecap(profileId: string, year: number): Promise<Recap> {
-  return createRecap(profileId, year).then(adaptRecap);
+export async function generateRecap(
+  profileId: string,
+  year: number,
+  onProgress?: ProgressListener,
+  signal?: AbortSignal,
+): Promise<Recap> {
+  const response = await createRecap(profileId, year, signal);
+  if (isRecapDTO(response)) return adaptRecap(response);
+  let latest = response;
+  try {
+    const ready = await streamRecapUntilReady(response, {
+      signal,
+      onProgress: (status) => {
+        latest = status;
+        onProgress?.(status);
+      },
+    });
+    return adaptRecap(ready);
+  } catch (cause) {
+    if (cause instanceof GenerationFailedError) throw cause;
+    if (cause instanceof DOMException && cause.name === 'AbortError') throw cause;
+    if (!(cause instanceof StreamUnavailableError)) throw cause;
+  }
+  const ready = await pollRecapUntilReady(latest, {
+    fetchStatus: getRecap,
+    onProgress,
+    signal,
+  });
+  return adaptRecap(ready);
 }
 
-export function loadRecap(recapId: string): Promise<Recap> {
-  return getRecap(recapId).then(adaptRecap);
+export async function loadRecap(recapId: string, signal?: AbortSignal): Promise<Recap> {
+  const response = await getRecap(recapId, signal);
+  if (isRecapDTO(response)) return adaptRecap(response);
+  let latest = response;
+  try {
+    const ready = await streamRecapUntilReady(response, {
+      signal,
+      onProgress: (status) => {
+        latest = status;
+      },
+    });
+    return adaptRecap(ready);
+  } catch (cause) {
+    if (cause instanceof GenerationFailedError) throw cause;
+    if (cause instanceof DOMException && cause.name === 'AbortError') throw cause;
+    if (!(cause instanceof StreamUnavailableError)) throw cause;
+  }
+  const ready = await pollRecapUntilReady(latest, {
+    fetchStatus: getRecap,
+    signal,
+  });
+  return adaptRecap(ready);
 }
 
-/**
- * Догружает обоснования. Вызывается лениво — только когда пользователь
- * раскрывает «почему», и только если это разрешено в capabilities.
- */
 export function loadExplanation(recap: Recap): Promise<Recap> {
   if (!recap.capabilities.explanationAvailable) return Promise.resolve(recap);
   return getExplanation(recap.recapId).then((dto) => applyExplanation(recap, dto));
@@ -36,4 +75,3 @@ export function loadExplanation(recap: Recap): Promise<Recap> {
 export function loadShareCard(recapId: string): Promise<ShareCardDTO> {
   return getShareCard(recapId);
 }
-

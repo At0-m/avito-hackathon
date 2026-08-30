@@ -24,42 +24,7 @@ func (s *Service) GenerateRecap(ctx context.Context, profileID string, year int)
 		return nil, false, err
 	}
 
-	profile, err := s.profiles.GetProfileByID(ctx, profileID)
-	if err != nil {
-		return nil, false, err
-	}
-	if !containsYear(profile.AvailableYears, year) {
-		return nil, false, ErrYearNotAvailable
-	}
-	if s.clickHouseActivities == nil {
-		return nil, false, ErrActivitySourceMissing
-	}
-	if s.recapGenerator == nil {
-		return nil, false, errors.New("recap_generator_missing")
-	}
-
-	activities, err := s.clickHouseActivities.GetActivitiesByProfileIDAndYear(ctx, profileID, year)
-	if err != nil {
-		log.Printf("failed to load ClickHouse activities: %v", err)
-		return nil, false, fmt.Errorf("%w: %v", ErrActivitySourceUnavailable, err)
-	}
-	recapEvents, err := convertActivities(activities)
-	if err != nil {
-		return nil, false, err
-	}
-
-	output, err := s.recapGenerator.Generate(ctx, recap.GenerateInput{
-		RecapID:     uuid.New().String(),
-		Profile:     convertProfile(profile),
-		Year:        year,
-		Activities:  recapEvents,
-		GeneratedAt: time.Now().UTC(),
-	})
-	if err != nil {
-		return nil, false, err
-	}
-
-	value, err := convertRecapOutput(output)
+	value, err := s.generateRecapValue(ctx, uuid.New().String(), profileID, year, nil)
 	if err != nil {
 		return nil, false, err
 	}
@@ -74,6 +39,65 @@ func (s *Service) GenerateRecap(ctx context.Context, profileID string, year int)
 		return nil, false, err
 	}
 	return value, true, nil
+}
+
+type progressReporter func(stage string, progress int) error
+
+func (s *Service) generateRecapValue(
+	ctx context.Context,
+	recapID string,
+	profileID string,
+	year int,
+	report progressReporter,
+) (*model.Recap, error) {
+	profile, err := s.profiles.GetProfileByID(ctx, profileID)
+	if err != nil {
+		return nil, err
+	}
+	if !containsYear(profile.AvailableYears, year) {
+		return nil, ErrYearNotAvailable
+	}
+	if s.clickHouseActivities == nil {
+		return nil, ErrActivitySourceMissing
+	}
+	if s.recapGenerator == nil {
+		return nil, errors.New("recap_generator_missing")
+	}
+
+	activities, err := s.clickHouseActivities.GetActivitiesByProfileIDAndYear(ctx, profileID, year)
+	if err != nil {
+		log.Printf("failed to load ClickHouse activities: %v", err)
+		return nil, fmt.Errorf("%w: %v", ErrActivitySourceUnavailable, err)
+	}
+	if report != nil {
+		if err := report("computing_features", 35); err != nil {
+			return nil, err
+		}
+	}
+	recapEvents, err := convertActivities(activities)
+	if err != nil {
+		return nil, err
+	}
+	if report != nil {
+		if err := report("personalizing", 55); err != nil {
+			return nil, err
+		}
+		if err := report("generating_narrative", 75); err != nil {
+			return nil, err
+		}
+	}
+
+	output, err := s.recapGenerator.Generate(ctx, recap.GenerateInput{
+		RecapID:     recapID,
+		Profile:     convertProfile(profile),
+		Year:        year,
+		Activities:  recapEvents,
+		GeneratedAt: time.Now().UTC(),
+	})
+	if err != nil {
+		return nil, err
+	}
+	return convertRecapOutput(output)
 }
 
 func convertActivities(values []ports.ActivityEvent) ([]recap.ActivityEvent, error) {

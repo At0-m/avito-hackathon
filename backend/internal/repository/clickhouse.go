@@ -45,7 +45,7 @@ func (r *ClickHouseRepository) GetActivitiesByProfileIDAndYear(
 		FROM activity_events FINAL
 		WHERE toString(profile_id) = '%s'
 			AND occurred_at >= toDateTime64('%04d-01-01 00:00:00', 3, 'UTC')
-			AND occurred_at < toDateTime64('%04d-01-01 00:00:00', 3, 'UTC')
+    	AND occurred_at < toDateTime64('%04d-01-01 00:00:00', 3, 'UTC')
 		ORDER BY occurred_at, event_id
 		FORMAT JSONEachRow
 	`, profileID, year, year+1)

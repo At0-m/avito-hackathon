@@ -4,7 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
+	"recap-personalization/internal/eventing"
 	"recap-personalization/internal/model"
 	recap "recap-personalization/internal/recap"
 	"recap-personalization/internal/recap/ports"
@@ -19,12 +21,20 @@ var (
 	ErrInteractionSinkUnavailable = errors.New("interaction_sink_unavailable")
 )
 
+type LifecyclePublisher interface {
+	PublishLifecycle(ctx context.Context, value eventing.RecapLifecycleV1) error
+}
+
 type Service struct {
 	profiles               repository.ProfileRepository
 	recaps                 repository.RecapRepository
 	recapGenerator         recap.Generator
 	clickHouseActivities   ports.ActivityRepository
 	clickHouseInteractions ports.InteractionRepository
+	recapRequests          repository.RecapRequestRepository
+	recapPollAfter         time.Duration
+	workerMaxAttempts      int
+	lifecyclePublisher     LifecyclePublisher
 }
 
 func NewService(
@@ -39,7 +49,23 @@ func NewService(
 		recapGenerator:         generator,
 		clickHouseActivities:   clickHouseActivities,
 		clickHouseInteractions: clickHouseInteractions,
+		recapRequests:          repo,
+		recapPollAfter:         500 * time.Millisecond,
+		workerMaxAttempts:      3,
 	}
+}
+
+func (s *Service) ConfigureAsync(pollAfter time.Duration, maxAttempts int) {
+	if pollAfter > 0 {
+		s.recapPollAfter = pollAfter
+	}
+	if maxAttempts > 0 {
+		s.workerMaxAttempts = maxAttempts
+	}
+}
+
+func (s *Service) ConfigureLifecyclePublisher(publisher LifecyclePublisher) {
+	s.lifecyclePublisher = publisher
 }
 
 func (s *Service) GetProfiles(ctx context.Context) ([]model.ProfileSummary, error) {

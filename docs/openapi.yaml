@@ -6,8 +6,9 @@ info:
   description: |
     REST API персональных «Итогов года» в концепции города.
 
-    Итоги формируются синхронно и только один раз для пары пользователь–год.
-    Повторный запрос возвращает ранее сформированный неизменяемый результат.
+    Запрос на формирование итогов принимается асинхронно и идемпотентно.
+    Worker обрабатывает команду в фоне, а клиент получает lifecycle через SSE
+    или polling. Готовый immutable snapshot остаётся совместимым с MVP.
   license:
     name: Proprietary Hackathon MVP
     url: https://github.com/inxrius/avito-hackathon
@@ -79,11 +80,12 @@ paths:
     post:
       tags: [Recaps]
       operationId: createRecap
-      summary: Сформировать итоги года один раз
+      summary: Принять запрос на формирование итогов года
       description: |
-        Синхронно формирует итоговый snapshot для пары `profile_id`–`year`.
-        Первый запрос возвращает `201 Created`. Если итог для этой пары уже
-        существует, он не пересчитывается и возвращается с `200 OK`.
+        Быстро создаёт идемпотентную задачу для пары `profile_id`–`year`.
+        Новый или уже выполняющийся запрос возвращает `202 Accepted` со
+        статусом для polling. Если immutable snapshot уже готов, он сразу
+        возвращается с `200 OK` в совместимом с MVP формате.
       requestBody:
         required: true
         content:
@@ -96,21 +98,25 @@ paths:
                   profile_id: 19369d67-1db3-4e87-b8a8-9c82991ba173
                   year: 2026
       responses:
-        "201":
-          description: Итоги впервые сформированы и сохранены.
+        "202":
+          description: Запрос принят или уже находится в очереди/обработке.
           headers:
             Location:
-              description: URI созданного recap.
+              description: URI статуса генерации.
               schema:
                 type: string
                 format: uri-reference
+            Retry-After:
+              description: Рекомендуемая пауза до следующего polling-запроса.
+              schema:
+                type: integer
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/Recap"
+                $ref: "#/components/schemas/RecapRequestStatus"
               examples:
-                created:
-                  $ref: "#/components/examples/Recap"
+                queued:
+                  $ref: "#/components/examples/RecapRequestQueued"
         "200":
           description: Возвращён ранее сформированный неизменяемый recap.
           content:
@@ -124,8 +130,6 @@ paths:
           $ref: "#/components/responses/InvalidArgument"
         "404":
           $ref: "#/components/responses/ProfileNotFound"
-        "422":
-          $ref: "#/components/responses/InsufficientActivity"
         "429":
           $ref: "#/components/responses/RateLimitExceeded"
         "503":
@@ -142,14 +146,49 @@ paths:
         - $ref: "#/components/parameters/RecapId"
       responses:
         "200":
-          description: Неизменяемый recap.
+          description: Текущий lifecycle status или готовый immutable recap.
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/Recap"
+                oneOf:
+                  - $ref: "#/components/schemas/RecapRequestStatus"
+                  - $ref: "#/components/schemas/Recap"
               examples:
-                default:
+                processing:
+                  $ref: "#/components/examples/RecapRequestProcessing"
+                ready:
                   $ref: "#/components/examples/Recap"
+        "404":
+          $ref: "#/components/responses/RecapNotFound"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /recaps/{id}/stream:
+    get:
+      tags: [Recaps]
+      operationId: streamRecap
+      summary: Подписаться на прогресс формирования итогов
+      description: |
+        Необязательный SSE-канал для событий `status`, `ready` и `failed`.
+        При разрыве соединения клиент продолжает работу через обычный
+        `GET /recaps/{id}` polling.
+      parameters:
+        - $ref: "#/components/parameters/RecapId"
+      responses:
+        "200":
+          description: Поток lifecycle-событий до terminal state.
+          content:
+            text/event-stream:
+              schema:
+                type: string
+              example: |
+                retry: 500
+
+                event: status
+                data: {"id":"6dfc1418-e106-49ab-b839-c9498418e8f6","status":"processing","stage":"computing_features","progress_percent":35}
+
+                event: ready
+                data: {"schema_version":"2.0","id":"6dfc1418-e106-49ab-b839-c9498418e8f6"}
         "404":
           $ref: "#/components/responses/RecapNotFound"
         "500":
@@ -420,6 +459,74 @@ components:
           type: integer
           minimum: 2000
           maximum: 2100
+
+    RecapRequestStatus:
+      type: object
+      additionalProperties: false
+      required:
+        - id
+        - profile_id
+        - year
+        - status
+        - stage
+        - progress_percent
+        - attempt
+        - max_attempts
+        - poll_after_ms
+        - links
+      properties:
+        id:
+          type: string
+          format: uuid
+        profile_id:
+          type: string
+          format: uuid
+        year:
+          type: integer
+          minimum: 2000
+          maximum: 2100
+        status:
+          type: string
+          enum: [queued, processing, ready, failed]
+        stage:
+          type: string
+          enum: [queued, starting, loading_activity, computing_features, personalizing, generating_narrative, persisting_snapshot, ready, failed]
+        progress_percent:
+          type: integer
+          minimum: 0
+          maximum: 100
+        attempt:
+          type: integer
+          minimum: 0
+        max_attempts:
+          type: integer
+          minimum: 1
+        poll_after_ms:
+          type: integer
+          minimum: 100
+        links:
+          type: object
+          additionalProperties: false
+          required: [self, stream]
+          properties:
+            self:
+              type: string
+              format: uri-reference
+            stream:
+              type: string
+              format: uri-reference
+        error:
+          type: object
+          nullable: true
+          additionalProperties: false
+          required: [code, message, retryable]
+          properties:
+            code:
+              type: string
+            message:
+              type: string
+            retryable:
+              type: boolean
 
     Recap:
       type: object
@@ -1198,6 +1305,38 @@ components:
           description: Продаёт вещи для дома и часто пользуется доставкой
           avatar_url: /assets/profiles/maria.webp
           available_years: [2026]
+
+    RecapRequestQueued:
+      summary: Задача принята в очередь
+      value:
+        id: 6dfc1418-e106-49ab-b839-c9498418e8f6
+        profile_id: 19369d67-1db3-4e87-b8a8-9c82991ba173
+        year: 2026
+        status: queued
+        stage: queued
+        progress_percent: 0
+        attempt: 0
+        max_attempts: 3
+        poll_after_ms: 500
+        links:
+          self: /api/v1/recaps/6dfc1418-e106-49ab-b839-c9498418e8f6
+          stream: /api/v1/recaps/6dfc1418-e106-49ab-b839-c9498418e8f6/stream
+
+    RecapRequestProcessing:
+      summary: Worker обрабатывает задачу
+      value:
+        id: 6dfc1418-e106-49ab-b839-c9498418e8f6
+        profile_id: 19369d67-1db3-4e87-b8a8-9c82991ba173
+        year: 2026
+        status: processing
+        stage: computing_features
+        progress_percent: 35
+        attempt: 1
+        max_attempts: 3
+        poll_after_ms: 500
+        links:
+          self: /api/v1/recaps/6dfc1418-e106-49ab-b839-c9498418e8f6
+          stream: /api/v1/recaps/6dfc1418-e106-49ab-b839-c9498418e8f6/stream
 
     Recap:
       summary: Однажды сформированные итоги в концепции города

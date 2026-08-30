@@ -20,13 +20,17 @@
 - интенсивность активности влияет на визуальную застройку;
 - роль, стиль и достижения объясняют поведение пользователя за год.
 
-Бизнес-факты, архетип и достижения вычисляются детерминированными правилами. Mistral используется только для короткой суммаризации поверх заранее разрешённых фактов. При отсутствии ключа или ошибке внешнего API backend автоматически возвращает воспроизводимый template fallback.
+Бизнес-факты, архетип и достижения вычисляются детерминированными правилами. Mistral используется только для короткой суммаризации поверх заранее разрешённых фактов. При отсутствии ключа или ошибке внешнего API бэкенд автоматически возвращает воспроизводимый шаблонный текст.
 
-## Что реализовано в MVP
+## Статус проекта
+
+На хакатоне команда собрала рабочий синхронный MVP: пользователь выбирал профиль, запускал генерацию и получал готовые итоги с интерактивным городом. Асинхронные обработчики, Redpanda, outbox и inbox, SSE и нагрузочные тесты были добавлены уже после хакатона как отдельная инженерная доработка. Подробный план этой доработки изначально был зафиксирован как период после MVP.
+
+## Что реализовано на хакатоне
 
 - выбор одного из тестовых профилей;
 - генерация recap для пары `profile_id + year`;
-- повторный запрос возвращает сохранённый immutable snapshot;
+- повторный запрос возвращает сохранённый неизменяемый snapshot;
 - интерактивный изометрический город на Canvas;
 - карточки с активными днями, ключевой метрикой, главным районом, ролью и стилем;
 - персональные достижения с уровнями;
@@ -34,46 +38,67 @@
 - безопасная публичная share-проекция;
 - обработка недостаточной активности и технических ошибок;
 - запись продуктовых interaction events;
-- template fallback при недоступном Mistral;
-- unit-тесты, линтеры и GitHub Actions CI;
-- запуск всего стека одной командой через Docker Compose.
+- шаблонный текст при недоступном Mistral;
+- модульные тесты, линтеры и GitHub Actions CI;
+- запуск всего стека через Docker Compose.
 
-## Архитектура
+## Что добавлено после хакатона
+
+- асинхронный `POST /recaps` со статусами `queued / processing / ready / failed`;
+- отдельный обработчик задач с повторными попытками, lease, heartbeat и увеличивающейся задержкой между попытками;
+- транзакционное создание задачи и outbox-события;
+- Redpanda, inbox потребителя и DLQ;
+- SSE с автоматическим переходом на polling;
+- транзакционное сохранение snapshot и статуса `ready`;
+- конкурентные тесты и тесты отказоустойчивости;
+- воспроизводимые сценарии нагрузочного тестирования;
+- разбиение крупных обработчиков бэкенда на небольшие функции.
+
+## Текущая архитектура
+
+Ниже показана текущая версия проекта с доработками после хакатона.
 
 ```mermaid
 flowchart LR
-    U[Browser] --> F[React + TypeScript\nNginx]
-    F -->|REST / JSON| B[Go + Gin API]
-    B --> P[(PostgreSQL)]
-    B --> C[(ClickHouse)]
-    B -. optional summary .-> M[Mistral API]
+    U[Браузер] --> F[React + TypeScript\nNginx]
+    F -->|POST /recaps| B[Go + Gin API]
+    F -->|SSE или polling| B
+    B -->|задача + outbox\nодна транзакция| P[(PostgreSQL)]
+    P --> O[Публикатор outbox]
+    O --> R[(Redpanda)]
+    R --> W[Обработчик recap]
+    P -. claim, lease и состояние .-> W
+    W --> C[(ClickHouse)]
+    W -. текст при наличии ключа .-> M[Mistral API]
+    W -->|транзакционное завершение| P
+    W -->|состояние / DLQ| R
 
-    P --- PS[Profiles, recap snapshots,\nexplanations, share projections]
-    C --- CS[Activity events,\ninteraction events]
+    P --- PS[Задачи, snapshots, inbox,\nобъяснения, публичные проекции]
+    C --- CS[События активности и взаимодействий]
 ```
 
 ### Поток генерации
 
-1. Frontend получает список профилей через `GET /api/v1/profiles`.
-2. Пользователь выбирает год и запускает `POST /api/v1/recaps`.
-3. Backend читает события профиля за год из ClickHouse.
-4. Аналитический модуль считает метрики, географию и hash активности.
-5. Правила персонализации выбирают роль, стиль и достижения.
-6. Narrative-модуль формирует summary через Mistral или template fallback.
-7. Готовый recap, explanations и share projection сохраняются в PostgreSQL.
-8. Frontend адаптирует API DTO к view model и показывает последовательность карточек.
+1. Фронтенд получает список профилей через `GET /api/v1/profiles`.
+2. `POST /api/v1/recaps` одной транзакцией создаёт задачу и запись outbox, затем возвращает `202 Accepted`.
+3. Публикатор outbox отправляет команду в Redpanda.
+4. Обработчик получает команду или подбирает задачу из PostgreSQL в режиме восстановления.
+5. Обработчик читает активность из ClickHouse, считает метрики и применяет правила персонализации.
+6. Модуль текста использует Mistral или шаблонный текст.
+7. Готовый recap и статус `ready` сохраняются одной транзакцией PostgreSQL.
+8. Фронтенд получает прогресс через SSE, а при разрыве соединения продолжает polling.
 
 ## Технологии
 
 | Область | Технологии |
 |---|---|
-| Frontend | React 19, TypeScript 6, Vite 8, React Router, Canvas API |
-| Backend | Go 1.23, Gin, `database/sql`, HTTP client |
+| Фронтенд | React 19, TypeScript 6, Vite 8, React Router, Canvas API |
+| Бэкенд | Go 1.23, Gin, `database/sql`, HTTP-клиент |
 | Хранилища | PostgreSQL 15, ClickHouse 24.8 |
-| AI | Mistral Chat Completions API, JSON Schema, deterministic fallback |
+| ИИ | Mistral Chat Completions API, JSON Schema, шаблонный текст |
 | Контракты | OpenAPI 3.0.3 |
-| Инфраструктура | Docker, Docker Compose, Nginx |
-| Quality | Go tests, `go vet`, `gofmt`, Node test runner, ESLint, Prettier, GitHub Actions |
+| Инфраструктура | Docker, Docker Compose, Nginx, Redpanda HTTP Proxy |
+| Качество | тесты Go, `go vet`, `gofmt`, тестовый runner Node.js, ESLint, Prettier, GitHub Actions |
 
 ## Быстрый запуск
 
@@ -93,8 +118,8 @@ docker compose up -d --build
 
 После запуска:
 
-- frontend: http://localhost:5173
-- backend API: http://localhost:8080/api/v1
+- фронтенд: http://localhost:5173
+- API бэкенда: http://localhost:8080/api/v1
 
 Проверка состояния:
 
@@ -103,22 +128,28 @@ docker compose ps
 curl http://localhost:8080/api/v1/profiles
 ```
 
+Обработчик задач и публикатор outbox не публикуют внешние порты. Количество обработчиков можно менять независимо от API:
+
+```bash
+docker compose up -d --scale worker=3
+```
+
 Остановка:
 
 ```bash
 docker compose down
 ```
 
-Полный сброс локальных данных и повторное применение seed-миграций:
+Полный сброс локальных данных и повторное применение тестовых миграций:
 
 ```bash
 docker compose down -v
 docker compose up -d --build
 ```
 
-## Mistral API key
+## Ключ Mistral API
 
-В репозитории **нет Mistral API key**. По умолчанию `MISTRAL_API_KEY` пустой, поэтому проект полностью работает с `template`-суммаризацией. Для проверки основного сценария ключ не требуется.
+В репозитории **нет ключа Mistral API**. По умолчанию `MISTRAL_API_KEY` пустой, поэтому проект работает с шаблонной суммаризацией. Для проверки основного сценария ключ не требуется.
 
 Чтобы локально включить Mistral и не коммитить секрет, создайте файл `.env` в корне репозитория:
 
@@ -133,12 +164,15 @@ services:
   backend:
     environment:
       MISTRAL_API_KEY: ${MISTRAL_API_KEY}
+  worker:
+    environment:
+      MISTRAL_API_KEY: ${MISTRAL_API_KEY}
 ```
 
 Оба файла исключены из Git. После этого запустите:
 
 ```bash
-docker compose up -d --build --force-recreate backend frontend
+docker compose up -d --build --force-recreate backend worker frontend
 ```
 
 В ответе нового recap поле `generation.narrative.source` будет равно `mistral`. Для уже сохранённого snapshot источник не меняется; для чистой проверки можно выполнить `docker compose down -v`.
@@ -147,12 +181,13 @@ docker compose up -d --build --force-recreate backend frontend
 
 Канонический контракт находится в [`docs/openapi.yaml`](docs/openapi.yaml).
 
-| Метод | Endpoint | Назначение |
+| Метод | Путь | Назначение |
 |---|---|---|
 | `GET` | `/api/v1/profiles` | Список профилей и доступных годов |
 | `GET` | `/api/v1/profiles/{id}` | Получение профиля |
-| `POST` | `/api/v1/recaps` | Создание или получение существующего recap |
-| `GET` | `/api/v1/recaps/{id}` | Получение сохранённого recap |
+| `POST` | `/api/v1/recaps` | Создать асинхронную задачу или вернуть готовый recap |
+| `GET` | `/api/v1/recaps/{id}` | Получить состояние задачи или готовый recap |
+| `GET` | `/api/v1/recaps/{id}/stream` | SSE-события `status`, `ready`, `failed` |
 | `GET` | `/api/v1/recaps/{id}/explanation` | Объяснение роли, стиля и достижений |
 | `GET` | `/api/v1/recaps/{id}/share` | Безопасная публичная проекция |
 | `POST` | `/api/v1/recaps/{id}/interactions` | Запись продуктового события |
@@ -168,65 +203,78 @@ curl -X POST http://localhost:8080/api/v1/recaps \
   }'
 ```
 
-Первый успешный запрос возвращает `201 Created`, повторный запрос для той же пары профиля и года - `200 OK` с тем же snapshot.
+Новый или выполняющийся запрос возвращает `202 Accepted` со статусом, `links.stream` и `poll_after_ms`. После завершения SSE присылает событие `ready`, а `GET /recaps/{id}` возвращает готовый snapshot; повторный `POST` возвращает его с `200 OK`.
 
 ## Структура проекта
 
 ```text
 .
-├── .github/workflows/       # GitHub Actions CI
+├── .github/workflows/       # проверки GitHub Actions
 ├── backend/
-│   ├── cmd/server/          # HTTP server entrypoint
+│   ├── cmd/server/          # HTTP API и SSE
+│   ├── cmd/worker/          # обработчик задач
+│   ├── cmd/outbox/          # публикация outbox-событий
+│   ├── cmd/bench-*/         # генерация нагрузки и отчётов
 │   ├── internal/
-│   │   ├── config/          # environment configuration
-│   │   ├── handler/         # Gin HTTP handlers
-│   │   ├── model/           # API models
-│   │   ├── recap/           # analytics, rules, narrative, assembly, pipeline
-│   │   ├── repository/      # PostgreSQL and ClickHouse adapters
-│   │   └── service/         # application orchestration
-│   ├── migrations/          # PostgreSQL and ClickHouse schema/seed
-│   ├── pkg/database/        # database clients
+│   │   ├── config/          # конфигурация
+│   │   ├── handler/         # HTTP-обработчики
+│   │   ├── model/           # модели API и хранения
+│   │   ├── recap/           # аналитика, правила и текст
+│   │   ├── repository/      # PostgreSQL и ClickHouse
+│   │   ├── broker/          # клиент Redpanda HTTP Proxy
+│   │   ├── eventing/        # контракты событий
+│   │   ├── outbox/          # цикл публикации
+│   │   ├── service/         # сценарии приложения
+│   │   └── worker/          # retry, lease и обработка команд
+│   ├── migrations/          # схемы и тестовые данные
 │   └── Dockerfile
 ├── frontend/
 │   ├── src/
-│   │   ├── app/             # router and application shell
-│   │   ├── pages/           # profiles, generation, recap, public share
-│   │   ├── entities/city/   # deterministic Canvas city renderer
-│   │   ├── widgets/         # share card UI
-│   │   └── shared/          # API adapter, types, palette, utilities
-│   ├── nginx.conf           # SPA serving and `/api` proxy
+│   │   ├── app/             # роутер и оболочка
+│   │   ├── pages/           # выбор профиля, генерация, recap и share
+│   │   ├── entities/city/   # Canvas-город
+│   │   ├── widgets/         # публичная карточка
+│   │   └── shared/          # API, типы и утилиты
+│   ├── nginx.conf           # SPA и прокси `/api`
 │   └── Dockerfile
-├── docs/                    # OpenAPI, DB model, task and Git workflow
-├── context/                 # compact architectural/product context
-└── docker-compose.yml       # full-stack local environment
+├── bench/                   # описание и результаты нагрузочных тестов
+├── scripts/                 # сценарии нагрузки и отказов
+├── docs/                    # API, хранение и асинхронный контур
+├── context/                 # краткий контекст проекта
+└── docker-compose.yml       # локальный стенд
 ```
 
 ## Особенности реализации
 
 ### Воспроизводимость
 
-Одинаковые события, год и версия алгоритма дают одинаковые метрики, роль, стиль и достижения. Snapshot содержит версию алгоритма и hash активности, а город получает детерминированный seed.
+Одинаковые события, год и версия алгоритма дают одинаковые метрики, роль, стиль и достижения. Готовый результат хранит версию алгоритма и хеш активности, а город получает детерминированный seed.
 
-### Разделение хранилищ
+### Хранилища
 
-- PostgreSQL - source of truth для профилей и готовых recap snapshots;
-- ClickHouse - событийное хранилище активности и продуктовой аналитики.
+- PostgreSQL хранит профили, состояние генерации и готовые snapshots;
+- ClickHouse хранит события активности и продуктовой аналитики;
+- Redpanda передаёт внутренние команды, но не хранит состояние задачи.
 
-### Объяснимость
+### Объяснимость и ИИ
 
-Роль, стиль и достижения выбираются правилами, а причины доступны через отдельную explanation-проекцию. AI не выбирает факты, архетипы или достижения.
-
-### Безопасная AI-суммаризация
-
-Mistral получает только allowlisted safe facts. Ответ проверяется по JSON Schema, ограничению длины, разрешённым числам и отсутствию URL. Любая ошибка приводит к deterministic template fallback и не ломает recap.
+Роль, стиль и достижения выбираются правилами. Mistral получает только разрешённые факты и формирует короткий текст. Ответ проверяется, а при любой ошибке используется шаблон.
 
 ### Приватность
 
-Публичная share-card формируется отдельно от личного recap и содержит только разрешённые поля. Подробные объяснения и внутренние метрики не попадают в публичную проекцию.
+Публичная карточка формируется отдельно и содержит только разрешённые поля. Личные объяснения и внутренние метрики в неё не попадают.
 
-### Frontend adapter
+### Надёжность асинхронной версии
 
-Backend остаётся источником истины для бизнес-данных. Frontend API adapter преобразует DTO в presentation model, не пересчитывая метрики и правила персонализации.
+Задача и outbox-событие создаются одной транзакцией. Worker использует `FOR UPDATE SKIP LOCKED`, lease и проверку владельца. Повторные команды отсеиваются через inbox. Snapshot и статус `ready` также сохраняются одной транзакцией.
+
+### SSE и polling
+
+API отправляет прогресс через Server-Sent Events. Если соединение разрывается, фронтенд продолжает получать состояние через обычный `GET`.
+
+### Нагрузочные тесты
+
+Команды `make bench-smoke`, `make bench-paths`, `make bench-matrix` и `make bench-faults` сохраняют исходные результаты и сведения об окружении в `bench/results/`.
 
 ## Тесты и CI
 
@@ -243,28 +291,28 @@ npm ci
 npm run check
 ```
 
-`npm run check` последовательно запускает frontend tests, ESLint и production build.
+`npm run check` последовательно запускает тесты фронтенда, ESLint и production-сборку.
 
 GitHub Actions выполняет:
 
-- проверку форматирования Go;
-- `go vet` и backend tests;
-- frontend tests, lint и build;
-- валидацию Docker Compose и сборку application images.
+- проверку форматирования, `go vet` и модульные тесты бэкенда;
+- race-тесты worker, outbox и broker;
+- интеграционные тесты PostgreSQL для конкурентного claim, lease, outbox и inbox;
+- тесты фронтенда, lint и production-сборку;
+- smoke-тест Docker с Redpanda, двумя workers, SSE и сценариями временной недоступности сервисов.
 
-## Ограничения MVP и дальнейшее развитие
+## Ограничения и дальнейшее развитие
 
-Текущая версия синхронно генерирует recap и визуально акцентирует главный район пользователя. Следующий приоритетный шаг - отдавать из backend безопасное распределение активности по нескольким вертикалям и одновременно показывать несколько полноценных районов в CityCanvas.
+Текущий интерфейс подробно показывает главный район пользователя. Следующий продуктовый шаг — передавать безопасное распределение активности по нескольким вертикалям и одновременно строить несколько полноценных районов в CityCanvas.
 
-В дальнейшей версии также рассматриваются:
+Другие возможные направления:
 
-- асинхронная генерация со статусами и SSE/polling;
-- broker/outbox/inbox для burst-нагрузки и повторной доставки;
-- отдельный Analytics Service и typed gRPC contract;
-- ClickHouse materialized views для массовой предгенерации;
-- воспроизводимые нагрузочные и fault-тесты.
+- отдельный сервис аналитики и gRPC только при необходимости независимого масштабирования;
+- материализованные представления ClickHouse для массовой предгенерации после измерений;
+- кластерные Redpanda и ClickHouse;
+- полноценные метрики и трассировка.
 
-Эти компоненты планируется добавлять только после benchmark: инфраструктура должна подтверждать пользу на измеримой нагрузке, а не усложнять продукт ради демонстрации.
+Асинхронный контур уже реализован после хакатона, но решение о его использовании в промышленной среде должно опираться на результаты нагрузочных тестов.
 
 ## Команда и распределение ответственности
 
@@ -272,26 +320,26 @@ GitHub Actions выполняет:
 |---|---|---|
 | Александр Цыков | `At0-m` | Продуктовая и техническая архитектура, OpenAPI, recap domain и analytics, правила персонализации, narrative/Mistral, сборка pipeline, интеграция backend с PostgreSQL/ClickHouse, стабилизация E2E, финальная frontend-полировка, тесты, CI и Docker Compose |
 | Станислав Шегай | `inxrius` | Инициализация репозитория, backend models, repository/service/HTTP layers, годовая фильтрация активности, интеграция generator pipeline|
-| Дмитрий | `DemiusHTTV` | Frontend и пользовательский сценарий, интерактивный Canvas-город, страницы и компоненты recap, адаптация frontend к реальному backend contract|
+| Дмитрий | `DemiusHTTV` | Фронтенд и пользовательский сценарий, интерактивный Canvas-город, страницы и компоненты recap, адаптация фронтенда к реальному контракту бэкенда |
 | Роман Карелин | `mamooin` | Восстановление и структурирование требований, ранние архитектурные решения, документация OpenAPI и модели базы данных |
 
-Зоны ответственности пересекались: архитектурные решения, интеграция контрактов, тестирование и финальная стабилизация выполнялись совместно через review и pull requests.
+Зоны ответственности пересекались: архитектурные решения, интеграция контрактов, тестирование и финальная стабилизация выполнялись совместно через ревью и Pull Request.
 
 ## История разработки
 
-Разработка велась в персональных feature/fix-ветках с pull requests в интеграционную ветку `dev`. Основные этапы:
+Хакатонная разработка велась в персональных ветках с Pull Request в `dev`. Основные этапы:
 
-1. фиксация требований, OpenAPI и модели данных;
-2. реализация recap analytics, personalization и narrative pipeline;
-3. создание repository/service/HTTP слоёв и подключение PostgreSQL/ClickHouse;
-4. frontend с детерминированным Canvas-городом;
-5. согласование frontend/backend contract и полный E2E flow;
-6. стабилизация Mistral fallback, interactions, share/explanation;
-7. тесты, CI и Docker Compose для воспроизводимого запуска.
+1. восстановление требований, OpenAPI и модели данных;
+2. аналитика, правила персонализации и pipeline формирования текста;
+3. слои repository, service и HTTP и подключение PostgreSQL/ClickHouse;
+4. фронтенд с детерминированным Canvas-городом;
+5. согласование контракта фронтенда и бэкенда и сквозной сценарий;
+6. резервный шаблон Mistral, interaction events, публичная карточка и объяснения;
+7. тесты, CI и Docker Compose.
 
-Подробная хронология ключевых коммитов и вклад участников вынесены в [`docs/commit-history.md`](docs/commit-history.md).
+После хакатона отдельным этапом были добавлены транзакции, асинхронные обработчики, Redpanda, SSE, нагрузочные тесты и тесты отказоустойчивости.
 
-Полную техническую историю можно посмотреть непосредственно в Git:
+Краткая хронология ключевых коммитов находится в [`docs/commit-history.md`](docs/commit-history.md). Полную историю можно посмотреть командой:
 
 ```bash
 git log --oneline --graph --decorate --all
@@ -299,8 +347,13 @@ git log --oneline --graph --decorate --all
 
 ## Документация
 
-- [`docs/openapi.yaml`](docs/openapi.yaml) - публичный API-контракт;
-- [`docs/database-models.md`](docs/database-models.md) - модель хранения;
-- [`docs/git-workflow.md`](docs/git-workflow.md) - процесс веток и PR;
-- [`docs/task.md`](docs/task.md) - структурированная постановка и Definition of Done;
-- [`context/PROJECT_CONTEXT.md`](context/PROJECT_CONTEXT.md) - компактный контекст проекта.
+- [`docs/openapi.yaml`](docs/openapi.yaml) — публичный API;
+- [`docs/async-generation.md`](docs/async-generation.md) — асинхронная генерация;
+- [`docs/event-contracts.md`](docs/event-contracts.md) — события Redpanda;
+- [`docs/database-models.md`](docs/database-models.md) — модель хранения;
+- [`docs/final-async-stage.md`](docs/final-async-stage.md) — доработка после хакатона;
+- [`docs/commit-history.md`](docs/commit-history.md) — ключевые коммиты и вклад команды;
+- [`bench/README.md`](bench/README.md) — нагрузочные тесты и тесты отказоустойчивости;
+- [`docs/git-workflow.md`](docs/git-workflow.md) — работа с ветками и Pull Request;
+- [`docs/task.md`](docs/task.md) — исходное задание;
+- [`context/PROJECT_CONTEXT.md`](context/PROJECT_CONTEXT.md) — краткий контекст проекта.

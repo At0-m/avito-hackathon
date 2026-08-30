@@ -66,7 +66,9 @@ func main() {
 		clickHouseRepository,
 		generator,
 	)
+	appService.ConfigureAsync(cfg.RecapPollAfter, cfg.WorkerMaxAttempts)
 	appHandler := handler.NewHandler(appService)
+	appHandler.ConfigureSSE(cfg.SSEPollInterval, cfg.SSEHeartbeatInterval)
 
 	router := gin.New()
 	router.Use(gin.Logger(), gin.Recovery())
@@ -77,7 +79,7 @@ func main() {
 		Handler:           router,
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       15 * time.Second,
-		WriteTimeout:      30 * time.Second,
+		WriteTimeout:      0,
 		IdleTimeout:       60 * time.Second,
 	}
 

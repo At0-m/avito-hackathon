@@ -41,7 +41,7 @@ export default defineConfig([
   {
     files: ['**/*.test.ts'],
     languageOptions: {
-      globals: { ...globals.browser, ...globals.node },
+      globals: globals.node,
     },
   },
 ]);
