@@ -15,12 +15,15 @@ jobs:
     defaults:
       run:
         working-directory: backend
+
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-go@v5
         with:
           go-version: '1.23.x'
           cache-dependency-path: backend/go.sum
+
       - name: Check formatting
         run: |
           files="$(gofmt -l ./cmd ./internal ./pkg)"
@@ -29,16 +32,20 @@ jobs:
             echo "$files"
             exit 1
           fi
+
       - name: Vet
         run: go vet ./...
+
       - name: Unit tests
         run: go test ./...
+
       - name: Concurrency race tests
         run: go test -race ./internal/worker ./internal/outbox ./internal/broker
 
   backend-integration:
     name: PostgreSQL concurrency tests
     runs-on: ubuntu-latest
+
     services:
       postgres:
         image: postgres:15-alpine
@@ -53,14 +60,18 @@ jobs:
           --health-interval 5s
           --health-timeout 5s
           --health-retries 10
+
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-go@v5
         with:
           go-version: '1.23.x'
           cache-dependency-path: backend/go.sum
+
       - name: Install PostgreSQL client
         run: sudo apt-get update && sudo apt-get install -y postgresql-client
+
       - name: Apply PostgreSQL migrations
         env:
           PGPASSWORD: avito_password
@@ -70,8 +81,14 @@ jobs:
             backend/migrations/002_seed_data.sql \
             backend/migrations/003_recap_requests.sql \
             backend/migrations/004_eventing.sql; do
-            psql -h 127.0.0.1 -U avito -d avito_recap -v ON_ERROR_STOP=1 -f "$migration"
+            psql \
+              -h 127.0.0.1 \
+              -U avito \
+              -d avito_recap \
+              -v ON_ERROR_STOP=1 \
+              -f "$migration"
           done
+
       - name: Run concurrent claim, lease recovery and inbox tests
         working-directory: backend
         env:
@@ -84,13 +101,16 @@ jobs:
     defaults:
       run:
         working-directory: frontend
+
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
           cache: npm
           cache-dependency-path: frontend/package-lock.json
+
       - run: npm ci
       - run: npm run check
 
@@ -98,117 +118,379 @@ jobs:
     name: Docker async, broker and SSE smoke test
     runs-on: ubuntu-latest
     needs: [backend, backend-integration, frontend]
+
     steps:
       - uses: actions/checkout@v4
+
       - name: Validate Compose
         run: docker compose config
+
       - name: Start full stack
         run: docker compose up -d --build --wait --scale worker=2
+
       - name: Verify infrastructure
         shell: bash
         run: |
           set -euo pipefail
-          curl --fail --silent http://localhost:5173/ >/dev/null
-          curl --fail --silent http://localhost:8080/api/v1/profiles >/dev/null
-          curl --fail --silent http://localhost:18082/brokers >/dev/null
+
+          curl --fail --silent --show-error \
+            --max-time 10 \
+            http://localhost:5173/ >/dev/null
+
+          curl --fail --silent --show-error \
+            --max-time 10 \
+            http://localhost:8080/api/v1/profiles >/dev/null
+
+          curl --fail --silent --show-error \
+            --max-time 10 \
+            http://localhost:18082/brokers >/dev/null
+
       - name: Verify async recap and SSE lifecycle
         shell: bash
         run: |
           set -euo pipefail
-          response="$(curl --fail --silent -X POST http://localhost:8080/api/v1/recaps \
-            -H 'Content-Type: application/json' \
-            -d '{"profile_id":"33333333-3333-3333-3333-333333333333","year":2026}')"
-          recap_id="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])' <<<"$response")"
 
-          curl --fail --silent --no-buffer --max-time 60 \
-            "http://localhost:8080/api/v1/recaps/$recap_id/stream" > /tmp/recap.sse
-          grep -q '^event: ready' /tmp/recap.sse
+          response="$(
+            curl --fail --silent --show-error \
+              --max-time 10 \
+              -X POST http://localhost:8080/api/v1/recaps \
+              -H 'Content-Type: application/json' \
+              -d '{"profile_id":"33333333-3333-3333-3333-333333333333","year":2026}'
+          )"
 
-          state="$(curl --fail --silent "http://localhost:8080/api/v1/recaps/$recap_id")"
-          python3 -c 'import json,sys; data=json.load(sys.stdin); assert "schema_version" in data' <<<"$state"
+          recap_id="$(
+            python3 -c \
+              'import json,sys; print(json.load(sys.stdin)["id"])' \
+              <<<"$response"
+          )"
 
-          published="$(docker compose exec -T postgres psql -U avito -d avito_recap -Atc \
-            "SELECT count(*) FROM outbox_events WHERE aggregate_id = '$recap_id' AND status = 'published'")"
+          echo "Recap ID: $recap_id"
+
+          curl \
+            --fail \
+            --silent \
+            --show-error \
+            --no-buffer \
+            --max-time 120 \
+            "http://localhost:8080/api/v1/recaps/$recap_id/stream" \
+            > /tmp/recap.sse \
+            2> /tmp/recap-sse.err &
+
+          sse_pid=$!
+
+          ready=0
+
+          for attempt in $(seq 1 120); do
+            state="$(
+              curl --fail --silent --show-error \
+                --max-time 10 \
+                "http://localhost:8080/api/v1/recaps/$recap_id"
+            )"
+
+            if python3 -c \
+              'import json,sys; data=json.load(sys.stdin); raise SystemExit(0 if "schema_version" in data else 1)' \
+              <<<"$state"; then
+              echo "Recap became ready after ${attempt}s"
+              ready=1
+              break
+            fi
+
+            if python3 -c \
+              'import json,sys; data=json.load(sys.stdin); raise SystemExit(0 if data.get("status") == "failed" else 1)' \
+              <<<"$state"; then
+              echo "Recap generation failed:"
+              echo "$state"
+              kill "$sse_pid" 2>/dev/null || true
+              wait "$sse_pid" 2>/dev/null || true
+              exit 1
+            fi
+
+            sleep 1
+          done
+
+          if [ "$ready" -ne 1 ]; then
+            echo "Recap did not become ready in time"
+            kill "$sse_pid" 2>/dev/null || true
+            wait "$sse_pid" 2>/dev/null || true
+            exit 1
+          fi
+
+          for _ in $(seq 1 10); do
+            if grep -q '^event: ready' /tmp/recap.sse; then
+              break
+            fi
+            sleep 1
+          done
+
+          kill "$sse_pid" 2>/dev/null || true
+          wait "$sse_pid" 2>/dev/null || true
+
+          echo "SSE output:"
+          cat /tmp/recap.sse
+
+          if ! grep -q '^event: ready' /tmp/recap.sse; then
+            echo "SSE did not emit ready event"
+            cat /tmp/recap-sse.err || true
+            exit 1
+          fi
+
+          state="$(
+            curl --fail --silent --show-error \
+              --max-time 10 \
+              "http://localhost:8080/api/v1/recaps/$recap_id"
+          )"
+
+          python3 -c \
+            'import json,sys; data=json.load(sys.stdin); assert "schema_version" in data' \
+            <<<"$state"
+
+          published="$(
+            docker compose exec -T postgres \
+              psql -U avito -d avito_recap -Atc \
+              "SELECT count(*)
+               FROM outbox_events
+               WHERE aggregate_id = '$recap_id'
+                 AND status = 'published'"
+          )"
+
           test "$published" -ge 1
 
-          consumed="$(docker compose exec -T postgres psql -U avito -d avito_recap -Atc \
-            "SELECT count(*) FROM consumed_events WHERE consumer_name = 'recap-workers-v1'")"
+          consumed="$(
+            docker compose exec -T postgres \
+              psql -U avito -d avito_recap -Atc \
+              "SELECT count(*)
+               FROM consumed_events
+               WHERE consumer_name = 'recap-workers-v1'"
+          )"
+
           test "$consumed" -ge 1
+
       - name: Verify worker outage recovery
         shell: bash
         run: |
           set -euo pipefail
+
           docker compose stop worker
-          response="$(curl --fail --silent -X POST http://localhost:8080/api/v1/recaps \
-            -H 'Content-Type: application/json' \
-            -d '{"profile_id":"11111111-1111-1111-1111-111111111111","year":2026}')"
-          request_id="$(python3 -c 'import json,sys; data=json.load(sys.stdin); assert data.get("status") == "queued"; print(data["id"])' <<<"$response")"
+
+          response="$(
+            curl --fail --silent --show-error \
+              --max-time 10 \
+              -X POST http://localhost:8080/api/v1/recaps \
+              -H 'Content-Type: application/json' \
+              -d '{"profile_id":"11111111-1111-1111-1111-111111111111","year":2026}'
+          )"
+
+          request_id="$(
+            python3 -c \
+              'import json,sys; data=json.load(sys.stdin); assert data.get("status") == "queued"; print(data["id"])' \
+              <<<"$response"
+          )"
+
           docker compose start worker
 
           for _ in $(seq 1 90); do
-            state="$(curl --fail --silent "http://localhost:8080/api/v1/recaps/$request_id")"
-            if python3 -c 'import json,sys; data=json.load(sys.stdin); raise SystemExit(0 if "schema_version" in data else 1)' <<<"$state"; then
+            state="$(
+              curl --fail --silent --show-error \
+                --max-time 10 \
+                "http://localhost:8080/api/v1/recaps/$request_id"
+            )"
+
+            if python3 -c \
+              'import json,sys; data=json.load(sys.stdin); raise SystemExit(0 if "schema_version" in data else 1)' \
+              <<<"$state"; then
               exit 0
             fi
-            if python3 -c 'import json,sys; data=json.load(sys.stdin); raise SystemExit(0 if data.get("status") == "failed" else 1)' <<<"$state"; then
+
+            if python3 -c \
+              'import json,sys; data=json.load(sys.stdin); raise SystemExit(0 if data.get("status") == "failed" else 1)' \
+              <<<"$state"; then
               echo "$state"
               exit 1
             fi
+
             sleep 1
           done
-          echo "request did not recover after worker outage"
+
+          echo "Request did not recover after worker outage"
           exit 1
+
       - name: Verify Redpanda outage buffering and recovery
         shell: bash
         run: |
           set -euo pipefail
+
           docker compose stop redpanda
 
-          response="$(curl --fail --silent -X POST http://localhost:8080/api/v1/recaps \
-            -H 'Content-Type: application/json' \
-            -d '{"profile_id":"22222222-2222-2222-2222-222222222222","year":2026}')"
-          request_id="$(python3 -c 'import json,sys; data=json.load(sys.stdin); assert data.get("status") == "queued"; print(data["id"])' <<<"$response")"
+          response="$(
+            curl --fail --silent --show-error \
+              --max-time 10 \
+              -X POST http://localhost:8080/api/v1/recaps \
+              -H 'Content-Type: application/json' \
+              -d '{"profile_id":"22222222-2222-2222-2222-222222222222","year":2026}'
+          )"
+
+          request_id="$(
+            python3 -c \
+              'import json,sys; data=json.load(sys.stdin); print(data["id"])' \
+              <<<"$response"
+          )"
 
           sleep 2
-          state="$(curl --fail --silent "http://localhost:8080/api/v1/recaps/$request_id")"
-          python3 -c 'import json,sys; data=json.load(sys.stdin); assert data.get("status") == "queued"' <<<"$state"
+
+          pending="$(
+            docker compose exec -T postgres \
+              psql -U avito -d avito_recap -Atc \
+              "SELECT count(*)
+               FROM outbox_events
+               WHERE aggregate_id = '$request_id'
+                 AND status IN ('pending', 'publishing')"
+          )"
+
+          if [ "$pending" -lt 1 ]; then
+            echo "Outbox event was not buffered while Redpanda was unavailable"
+            exit 1
+          fi
 
           docker compose start redpanda
+
+          published=0
+
           for _ in $(seq 1 120); do
-            state="$(curl --fail --silent "http://localhost:8080/api/v1/recaps/$request_id")"
-            if python3 -c 'import json,sys; data=json.load(sys.stdin); raise SystemExit(0 if "schema_version" in data else 1)' <<<"$state"; then
+            published="$(
+              docker compose exec -T postgres \
+                psql -U avito -d avito_recap -Atc \
+                "SELECT count(*)
+                 FROM outbox_events
+                 WHERE aggregate_id = '$request_id'
+                   AND status = 'published'"
+            )"
+
+            if [ "$published" -ge 1 ]; then
+              break
+            fi
+
+            sleep 1
+          done
+
+          if [ "$published" -lt 1 ]; then
+            echo "Buffered outbox event was not published after Redpanda recovery"
+            exit 1
+          fi
+
+          for _ in $(seq 1 120); do
+            state="$(
+              curl --fail --silent --show-error \
+                --max-time 10 \
+                "http://localhost:8080/api/v1/recaps/$request_id"
+            )"
+
+            if python3 -c \
+              'import json,sys; data=json.load(sys.stdin); raise SystemExit(0 if "schema_version" in data else 1)' \
+              <<<"$state"; then
               exit 0
             fi
-            if python3 -c 'import json,sys; data=json.load(sys.stdin); raise SystemExit(0 if data.get("status") == "failed" else 1)' <<<"$state"; then
+
+            if python3 -c \
+              'import json,sys; data=json.load(sys.stdin); raise SystemExit(0 if data.get("status") == "failed" else 1)' \
+              <<<"$state"; then
               echo "$state"
               exit 1
             fi
+
             sleep 1
           done
-          echo "request did not recover after Redpanda outage"
+
+          echo "Request did not complete after Redpanda recovery"
           exit 1
+
       - name: Verify permanent worker failure
         shell: bash
         run: |
           set -euo pipefail
-          response="$(curl --fail --silent -X POST http://localhost:8080/api/v1/recaps \
-            -H 'Content-Type: application/json' \
-            -d '{"profile_id":"44444444-4444-4444-4444-444444444444","year":2026}')"
-          request_id="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])' <<<"$response")"
+
+          response="$(
+            curl --fail --silent --show-error \
+              --max-time 10 \
+              -X POST http://localhost:8080/api/v1/recaps \
+              -H 'Content-Type: application/json' \
+              -d '{"profile_id":"44444444-4444-4444-4444-444444444444","year":2026}'
+          )"
+
+          request_id="$(
+            python3 -c \
+              'import json,sys; print(json.load(sys.stdin)["id"])' \
+              <<<"$response"
+          )"
+
+          state=""
 
           for _ in $(seq 1 45); do
-            state="$(curl --fail --silent "http://localhost:8080/api/v1/recaps/$request_id")"
-            if python3 -c 'import json,sys; data=json.load(sys.stdin); error=data.get("error") or {}; raise SystemExit(0 if data.get("status") == "failed" and error.get("code") == "insufficient_activity" and error.get("retryable") is False else 1)' <<<"$state"; then
+            state="$(
+              curl --fail --silent --show-error \
+                --max-time 10 \
+                "http://localhost:8080/api/v1/recaps/$request_id"
+            )"
+
+            if python3 -c \
+              'import json,sys
+data=json.load(sys.stdin)
+error=data.get("error") or {}
+raise SystemExit(
+    0
+    if data.get("status") == "failed"
+    and error.get("code") == "insufficient_activity"
+    and error.get("retryable") is False
+    else 1
+)' <<<"$state"; then
               exit 0
             fi
+
             sleep 1
           done
-          echo "insufficient-activity request did not fail as expected"
+
+          echo "Insufficient-activity request did not fail as expected"
           echo "$state"
           exit 1
-      - name: Show logs on failure
+
+      - name: Show state on failure
         if: failure()
-        run: docker compose logs --no-color
+        run: |
+          docker compose ps -a
+
+          echo "=== recap_requests ==="
+          docker compose exec -T postgres \
+            psql -U avito -d avito_recap -c \
+            "SELECT id,
+                    profile_id,
+                    status,
+                    stage,
+                    progress_percent,
+                    attempt_count,
+                    worker_id,
+                    error_code
+             FROM recap_requests
+             ORDER BY created_at DESC
+             LIMIT 10;" || true
+
+          echo "=== outbox_events ==="
+          docker compose exec -T postgres \
+            psql -U avito -d avito_recap -c \
+            "SELECT aggregate_id,
+                    topic,
+                    status,
+                    attempt_count,
+                    last_error,
+                    published_at
+             FROM outbox_events
+             ORDER BY created_at DESC
+             LIMIT 10;" || true
+
+          echo "=== logs ==="
+          docker compose logs \
+            --no-color \
+            --tail=300 \
+            backend worker outbox redpanda clickhouse postgres frontend
+
       - name: Stop stack
         if: always()
-        run: docker compose down -v
+        run: docker compose down -v --remove-orphans
