@@ -147,13 +147,42 @@ func (r *Repository) getRecap(ctx context.Context, query string, args ...interfa
 }
 
 func (r *Repository) CreateRecap(ctx context.Context, value *model.Recap) error {
-	tx, err := r.DB.DB.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
+	return r.DB.WithinTransaction(ctx, nil, func(tx *sql.Tx) error {
+		return insertRecapSnapshotTx(ctx, tx, value)
+	})
+}
 
-	_, err = tx.ExecContext(ctx, `
+func (r *Repository) FinalizeRecapRequest(
+	ctx context.Context,
+	requestID, workerID string,
+	value *model.Recap,
+) error {
+	return r.DB.WithinTransaction(ctx, nil, func(tx *sql.Tx) error {
+		if err := insertRecapSnapshotTx(ctx, tx, value); err != nil {
+			return err
+		}
+		return requireOwnedRequestUpdate(ctx, tx, `
+			UPDATE recap_requests
+			SET
+				status = 'ready',
+				stage = 'ready',
+				progress_percent = 100,
+				recap_id = $3,
+				worker_id = NULL,
+				locked_at = NULL,
+				lease_expires_at = NULL,
+				error_code = NULL,
+				error_message = NULL,
+				retryable = FALSE,
+				finished_at = CURRENT_TIMESTAMP,
+				updated_at = CURRENT_TIMESTAMP
+			WHERE id = $1 AND status = 'processing' AND worker_id = $2
+		`, requestID, workerID, value.ID)
+	})
+}
+
+func insertRecapSnapshotTx(ctx context.Context, tx *sql.Tx, value *model.Recap) error {
+	_, err := tx.ExecContext(ctx, `
 		INSERT INTO recaps (
 			id,
 			profile_id,
@@ -228,8 +257,7 @@ func (r *Repository) CreateRecap(ctx context.Context, value *model.Recap) error 
 	if err := insertShare(ctx, tx, value); err != nil {
 		return err
 	}
-
-	return tx.Commit()
+	return nil
 }
 
 func insertCards(ctx context.Context, tx *sql.Tx, value *model.Recap) error {
