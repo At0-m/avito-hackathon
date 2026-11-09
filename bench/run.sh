@@ -63,6 +63,40 @@ step() {
 
 tools() { "${DC[@]}" --profile tools run --rm --no-deps -T tools "$@"; }
 
+COMMAND_GROUP=recap-workers-v1
+
+describe_group() {
+  "${DC[@]}" exec -T redpanda rpk group describe "$COMMAND_GROUP" -X brokers=redpanda:9092 2>&1 || true
+}
+
+group_members() {
+  describe_group | awk '$1 == "MEMBERS" { print $2; found = 1 } END { if (!found) print -1 }'
+}
+
+# wait_group_members waits until the command consumer group has exactly
+# WORKERS members. A worker that died without deleting its HTTP Proxy
+# consumer (kill -9, OOM, a container recreated by an older build) stays a
+# member until pandaproxy.consumer_instance_timeout_ms (300 s by default)
+# and keeps its partitions unconsumed; starting load in that state measures
+# the stale member, not the system.
+wait_group_members() {
+  local label=$1 deadline members
+  deadline=$(($(date +%s) + ${BENCH_GROUP_WAIT_S:-360}))
+  while true; do
+    members=$(group_members)
+    if [ "$members" = "$WORKERS" ]; then break; fi
+    if [ "$(date +%s)" -ge "$deadline" ]; then
+      echo "$(now) consumer group $COMMAND_GROUP has $members members, expected $WORKERS" >>"$RESULT_DIR/steps-failed.log"
+      log "consumer group has $members members, expected $WORKERS; continuing, the report marks the run"
+      break
+    fi
+    log "consumer group has $members members, waiting for $WORKERS (stale HTTP Proxy consumers expire after 5 min)"
+    sleep 10
+  done
+  describe_group >"$RESULT_DIR/group-$label.txt"
+  echo "GROUP_MEMBERS_$(echo "$label" | tr '[:lower:]-' '[:upper:]_')=$members" >>"$RESULT_DIR/run.env"
+}
+
 stand_up() {
   log "building and starting the bench stand (project $PROJECT, workers=$WORKERS, source=$BENCH_COMMAND_SOURCE)"
   "${DC[@]}" build
@@ -178,6 +212,9 @@ prepare_run() {
   if [ "$BENCH_COMMAND_SOURCE" != "database" ]; then consumers=$WORKERS; fi
   step tools bench-verify metrics --expect "api=1,outbox=1,worker=$WORKERS,sampler=1" \
     --expect-consumers "$consumers" --wait 180s --output "$CONTAINER_DIR/metrics-start.json"
+  if [ "$BENCH_COMMAND_SOURCE" != "database" ]; then
+    wait_group_members start
+  fi
 
   capture_host
   step tools bench-environment --output "$CONTAINER_DIR/environment.json" \
@@ -247,6 +284,7 @@ finish_run() {
     --output "$CONTAINER_DIR/metrics-end.json"
   mark run_end >/dev/null
   stop_docker_stats
+  describe_group >"$RESULT_DIR/group-end.txt"
   "${DC[@]}" ps -a >"$RESULT_DIR/compose-ps.txt" 2>&1 || true
   "${DC[@]}" logs --no-color --timestamps backend outbox worker sampler >"$RESULT_DIR/logs/services.log" 2>&1 || true
   "${DC[@]}" logs --no-color --timestamps redpanda clickhouse postgres >"$RESULT_DIR/logs/infrastructure.log" 2>&1 || true

@@ -2,6 +2,10 @@
 # Every worker replica is discovered through Docker DNS (the service name
 # resolves to all replica IPs), so `up{job="worker"}` has one series per
 # live replica. bench-verify metrics compares that count with WORKERS.
+#
+# VictoriaMetrics does not accept refresh_interval inside dns_sd_configs
+# (the stand failed to start with it); the DNS re-resolution period is set
+# globally by -promscrape.dnsSDCheckInterval in bench/compose.bench.yml.
 global:
   scrape_interval: 5s
   scrape_timeout: 4s
@@ -16,14 +20,12 @@ scrape_configs:
       - names: ["outbox"]
         type: A
         port: 9100
-        refresh_interval: 5s
 
   - job_name: worker
     dns_sd_configs:
       - names: ["worker"]
         type: A
         port: 9100
-        refresh_interval: 5s
 
   - job_name: sampler
     static_configs:

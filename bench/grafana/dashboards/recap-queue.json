@@ -71,7 +71,7 @@
       "id": 5,
       "type": "timeseries",
       "title": "Consumer lag command topic по партициям (Redpanda)",
-      "description": "max_offset − committed_offset группы recap-workers-v1. «No data» означает недоступность метрики (Redpanda не отдаёт consumer group metrics или target down), а не нулевой lag. В database-режиме lag не показывает незавершённую генерацию.",
+      "description": "max_offset − committed_offset группы recap-workers-v1. «No data» означает недоступность метрики (Redpanda не отдаёт consumer group metrics или target down), а не нулевой lag. В database-режиме lag не показывает незавершённую генерацию. Worker коммитит offset последней обработанной записи (семантика HTTP Proxy), поэтому у догнавшей партиции значение может быть 1.",
       "gridPos": {"h": 9, "w": 12, "x": 0, "y": 18},
       "datasource": {"type": "prometheus", "uid": "bench-vm"},
       "fieldConfig": {"defaults": {"unit": "short", "min": 0}, "overrides": []},

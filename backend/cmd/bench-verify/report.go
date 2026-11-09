@@ -253,6 +253,11 @@ func (r reportInputs) commonGates() {
 	} else {
 		r.add(categoryMeasurement, "preflight данных", strings.Join(preflight.Problems, "; "), "без замечаний", preflight.Passed)
 	}
+	if members, ok := r.env["GROUP_MEMBERS_START"]; ok {
+		// Stale HTTP Proxy consumers hold partitions until they expire; a run
+		// started with them measures the stale member, not the stand.
+		r.add(categoryMeasurement, "члены consumer group перед нагрузкой", members, r.env["WORKERS"], members == r.env["WORKERS"])
+	}
 	if start, ok := r.metrics("metrics-start.json"); ok {
 		r.add(categoryMeasurement, "scrape targets до нагрузки", describeTargets(start), describeExpected(start), start.Passed)
 	}
@@ -408,7 +413,7 @@ func (r reportInputs) smoke() {
 		r.k6Section("k6 · smoke", summary)
 	}
 	if drain, ok := r.drain("smoke"); ok {
-		r.add(categoryCorrectness, "smoke: drain завершён", fmt.Sprintf("%.1f с после конца подачи", drain.DrainSeconds), "до deadline "+drain.Deadline, drain.Completed)
+		r.add(categoryCorrectness, "smoke: drain завершён", drainValue(drain), "до deadline "+drain.Deadline, drain.Completed)
 	}
 	if value, ok := r.reconcile("smoke"); ok {
 		r.correctnessGates(value, "smoke", expected)
@@ -434,7 +439,7 @@ func (r reportInputs) steady() {
 		r.k6Section("k6 · измерение", summary)
 	}
 	if drain, ok := r.drain("measure"); ok {
-		r.add(categoryCorrectness, "измерение: drain завершён", fmt.Sprintf("%.1f с", drain.DrainSeconds), "до deadline "+drain.Deadline, drain.Completed)
+		r.add(categoryCorrectness, "измерение: drain завершён", drainValue(drain), "до deadline "+drain.Deadline, drain.Completed)
 	}
 	if reconciled {
 		users := value.User.Observed
@@ -582,7 +587,7 @@ func (r reportInputs) burst() {
 		r.reconcileSection("Сверка с PostgreSQL · burst", value)
 	}
 	if drain, ok := r.drain("burst"); ok {
-		r.add(categoryCorrectness, "drain после остановки подачи", fmt.Sprintf("%.1f с", drain.DrainSeconds), "до deadline "+drain.Deadline, drain.Completed)
+		r.add(categoryCorrectness, "drain после остановки подачи", drainValue(drain), "до deadline "+drain.Deadline, drain.Completed)
 		r.section("Drain после остановки нагрузки", fmt.Sprintf("- От конца подачи до готовности всех работ: %.1f с (первая готовность в окне: %.1f с)", drain.DrainSeconds, drain.FirstReadySeconds))
 	}
 	r.verdictLine("burst",
@@ -603,7 +608,7 @@ func (r reportInputs) soak() {
 		r.k6Section("k6 · soak", summary)
 	}
 	if drain, ok := r.drain("soak"); ok {
-		r.add(categoryCorrectness, "drain после остановки подачи", fmt.Sprintf("%.1f с", drain.DrainSeconds), "до deadline "+drain.Deadline, drain.Completed)
+		r.add(categoryCorrectness, "drain после остановки подачи", drainValue(drain), "до deadline "+drain.Deadline, drain.Completed)
 	}
 	if reconciled {
 		r.correctnessGates(value, "soak", int(rate*duration)+value.User.Observed)
@@ -733,6 +738,15 @@ func renderReport(data *reportData) string {
 	builder.WriteString("- `metrics-*.json` — targets, ряды k6, режим narrative, серверные показатели окна\n")
 	builder.WriteString("- `phases.log` — UTC-границы фаз; `docker-stats.jsonl` — CPU/память контейнеров; `logs/` — логи сервисов\n")
 	return builder.String()
+}
+
+// drainValue describes a drain wait; an unfinished drain has no duration.
+func drainValue(drain drainResult) string {
+	if !drain.Completed {
+		return fmt.Sprintf("не завершён за %s: ready=%d, failed=%d, незавершённых=%d, найдено в PG %d из %d",
+			drain.Deadline, drain.Final.Ready, drain.Final.Failed, drain.Final.Pending, drain.Final.FoundInP, drain.Expected)
+	}
+	return fmt.Sprintf("%.1f с от конца подачи (первая готовность %.1f с)", drain.DrainSeconds, drain.FirstReadySeconds)
 }
 
 func escapeCell(value string) string {
