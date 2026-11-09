@@ -81,6 +81,8 @@ Exit code: `0` — все проверки пройдены, иначе не н�
 
 Параметры: `SMOKE_COUNT=100`, `SMOKE_RATE=5`, `SMOKE_POLL_EVERY_NTH=10`, `WORKERS=3`.
 
+Квота и исчерпание различаются. `constant-arrival-rate` (5/с × 20 с) может стартовать ещё одну итерацию на границе окна (`iterationInTest = 100`). Такая итерация не отправляет POST и учитывается в `iterations_over_quota` (manifest `k: "over_quota"`): квота выполнена, это не ошибка. `profiles_exhausted` растёт, только если для запланированного POST (`iteration < quota`) нет подготовленного профиля, — это «нагрузка не достигнута». Smoke проверяет оба условия: `profiles_exhausted = 0` и ровно `SMOKE_COUNT` POST. Правила выбора профиля лежат в `bench/k6/lib/profiles.js`, регрессионный тест граничного индекса — `node --test bench/k6/lib/profiles.test.js`.
+
 ### Steady cold — `make bench-steady`
 
 - Прогрев: 20 POST/с в течение 60 с на отдельных 1200 профилях. Затем ожидание пустой очереди и сверка прогрева.
@@ -284,6 +286,7 @@ go test ./internal/telemetry ./internal/config ./internal/recap/narrative ./inte
 go test ./...
 go test -race ./internal/worker ./internal/outbox ./internal/broker
 docker compose -p avito-recap-bench -f ../bench/compose.bench.yml config >/dev/null
+node --test ../bench/k6/lib/profiles.test.js
 ```
 
 ---

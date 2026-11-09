@@ -37,7 +37,11 @@ const (
 	KindContractError = "contract_error"
 	KindRejected      = "rejected"
 	KindTransport     = "transport"
-	KindExhausted     = "exhausted"
+	// KindExhausted: a planned POST had no seeded profile (load not reached).
+	KindExhausted = "exhausted"
+	// KindOverQuota: the executor started an iteration after the quota was
+	// complete; no POST was sent and it is not an error.
+	KindOverQuota = "over_quota"
 )
 
 type manifestStats struct {

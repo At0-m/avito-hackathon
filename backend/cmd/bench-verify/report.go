@@ -343,7 +343,8 @@ func (r reportInputs) p95Gate(summary k6Summary, metric, label string) {
 
 func (r reportInputs) reconcileSection(title string, value ReconcileResult) {
 	lines := []string{
-		fmt.Sprintf("- POST отправлено: %d (по сценариям: %s); пропуски генератора (исчерпание): %d", value.PostsSent, describeCounts(value.PostsByScenario), value.GeneratorExhausted),
+		fmt.Sprintf("- POST отправлено: %d (по сценариям: %s); нехватка профиля для запланированного POST: %d; итерации сверх квоты: %d",
+			value.PostsSent, describeCounts(value.PostsByScenario), value.GeneratorExhausted, value.IterationsOverQuota),
 		fmt.Sprintf("- Исходы POST: новый 202=%d, повторный 202=%d, готовый 200=%d, failed 202=%d, 4xx=%d, transport/5xx=%d, нарушение контракта=%d",
 			value.New202, value.Repeat202, value.Ready200, value.Failed202, value.Rejected4xx, value.Ambiguous, value.ContractError),
 		fmt.Sprintf("- HTTP статусы: %s", describeCounts(value.HTTPStatuses)),
@@ -391,6 +392,7 @@ func (r reportInputs) k6Section(title string, summary k6Summary) {
 			summary.value("posts_started", "count"), summary.value("posts_accepted_202", "count"),
 			summary.value("posts_ready_200", "count"), summary.value("post_failures", "count"),
 			summary.value("dropped_iterations", "count"), summary.value("profiles_exhausted", "count")),
+		fmt.Sprintf("- Итераций после выполнения квоты (без POST, не ошибка): %.0f", summary.value("iterations_over_quota", "count")),
 		"",
 		"| Метрика k6, мс | n | p50 | p95 | max |",
 		"|---|---:|---:|---:|---:|",
@@ -410,6 +412,8 @@ func (r reportInputs) smoke() {
 	expected := int(r.envFloat("SMOKE_COUNT", 100))
 	if summary, ok := r.summary("smoke"); ok {
 		r.loadGates(summary, int(summary.value("posts_started", "count")), r.envFloat("SMOKE_COUNT", 100)/r.envFloat("SMOKE_RATE", 5), r.envFloat("SMOKE_RATE", 5), "smoke")
+		posts := int(summary.value("posts_started", "count"))
+		r.add(categoryLoad, "smoke: ровно запланированное число POST", strconv.Itoa(posts), strconv.Itoa(expected), posts == expected)
 		r.k6Section("k6 · smoke", summary)
 	}
 	if drain, ok := r.drain("smoke"); ok {

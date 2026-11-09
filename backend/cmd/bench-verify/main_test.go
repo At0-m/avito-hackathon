@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"math"
 	"os"
 	"path/filepath"
@@ -90,6 +91,40 @@ func TestReconcileClassifiesNew202Ready200AndTimeoutResolvedLater(t *testing.T) 
 	}
 	if result.ServerTimeToReady["m"].P95 != 2*time.Second {
 		t.Fatalf("server time to ready p95=%s", result.ServerTimeToReady["m"].P95)
+	}
+}
+
+// Smoke 20261109T191018Z: 100 planned POSTs at 5/s x 20s; k6 started a 101st
+// arrival at the window boundary. It must be reported as over quota, not as
+// a missing profile, and must not count as a sent POST.
+func TestReconcileSeparatesOverQuotaFromExhaustion(t *testing.T) {
+	created := runStart.Add(time.Second)
+	var entries []Entry
+	var rows []RequestRow
+	var snapshots []SnapshotRow
+	for index := 0; index < 100; index++ {
+		id := fmt.Sprintf("r%03d", index)
+		profile := fmt.Sprintf("p%03d", index)
+		entries = append(entries, Entry{Scenario: "smoke", Phase: "smoke", Iteration: int64(index), Index: index,
+			ProfileID: profile, Year: 2026, StartMS: int64(index + 1), Status: 202, ID: id, Kind: KindAccepted})
+		rows = append(rows, readyRow(id, profile, created, time.Second))
+		snapshots = append(snapshots, SnapshotRow{ID: id, ProfileID: profile, Year: 2026, NarrativeSource: "template"})
+	}
+	entries = append(entries, Entry{Scenario: "smoke", Phase: "smoke", Iteration: 100, Kind: KindOverQuota})
+
+	result := Reconcile(entries, stateWith(rows, snapshots...), ReconcileOptions{RunStart: runStart})
+	if result.PostsSent != 100 || result.GeneratorExhausted != 0 || result.IterationsOverQuota != 1 {
+		t.Fatalf("posts=%d exhausted=%d over_quota=%d", result.PostsSent, result.GeneratorExhausted, result.IterationsOverQuota)
+	}
+	if result.ReadyWithSnap != 100 || result.New202 != 100 {
+		t.Fatalf("ready=%d new202=%d", result.ReadyWithSnap, result.New202)
+	}
+
+	// A real shortage stays visible as exhaustion.
+	short := append(entries[:99:99], Entry{Scenario: "smoke", Phase: "smoke", Iteration: 99, Index: 99, Kind: KindExhausted})
+	result = Reconcile(short, stateWith(rows[:99], snapshots[:99]...), ReconcileOptions{RunStart: runStart})
+	if result.PostsSent != 99 || result.GeneratorExhausted != 1 || result.IterationsOverQuota != 0 {
+		t.Fatalf("posts=%d exhausted=%d over_quota=%d", result.PostsSent, result.GeneratorExhausted, result.IterationsOverQuota)
 	}
 }
 

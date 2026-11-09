@@ -17,6 +17,7 @@ import exec from 'k6/execution';
 import { sleep } from 'k6';
 import { SharedArray } from 'k6/data';
 import { Counter, Trend, Gauge } from 'k6/metrics';
+import { selectProfile, SELECT_EXHAUSTED, SELECT_OVER_QUOTA } from './lib/profiles.js';
 
 function num(name, fallback) {
   const raw = __ENV[name];
@@ -49,7 +50,11 @@ const postsFailed202 = new Counter('posts_failed_202');
 const postsContractError = new Counter('posts_contract_error');
 const postsRejected = new Counter('posts_rejected');
 const postsTransport = new Counter('posts_transport_error');
+// A planned POST (iteration < quota) had no seeded profile: load not reached.
 const profilesExhausted = new Counter('profiles_exhausted');
+// The executor started an iteration after the quota was complete (for example
+// the boundary arrival of constant-arrival-rate); no POST, not an error.
+const iterationsOverQuota = new Counter('iterations_over_quota');
 const accept202 = new Trend('post_accept_202', true);
 const accept200 = new Trend('post_accept_200', true);
 const targetRate = new Gauge('target_post_rate');
@@ -317,16 +322,21 @@ function postRecap(profileId, index, scenario, phase, iteration, isUser) {
   return result;
 }
 
-function pickProfile(cohort, iteration) {
-  if (cohort.fixed) return cohort.offset;
-  if (iteration >= cohort.count) return -1;
-  const index = cohort.offset + iteration;
-  return index < profiles.length ? index : -1;
-}
-
-function exhausted(scenario, phase, iteration) {
-  profilesExhausted.add(1, { phase });
-  manifest({ s: scenario, ph: phase, it: iteration, k: 'exhausted' });
+// pickProfile returns the profile index or -1 after recording why no POST is
+// sent: over_quota (quota complete) or exhausted (planned POST, no profile).
+function pickProfile(cohort, scenario, phase, iteration) {
+  const selected = selectProfile(cohort, iteration, profiles.length);
+  if (selected.kind === SELECT_OVER_QUOTA) {
+    iterationsOverQuota.add(1, { phase });
+    manifest({ s: scenario, ph: phase, it: iteration, k: 'over_quota' });
+    return -1;
+  }
+  if (selected.kind === SELECT_EXHAUSTED) {
+    profilesExhausted.add(1, { phase });
+    manifest({ s: scenario, ph: phase, it: iteration, pi: selected.index, k: 'exhausted' });
+    return -1;
+  }
+  return selected.index;
 }
 
 export function capacity() {
@@ -334,12 +344,9 @@ export function capacity() {
   const cohort = cohorts[scenario];
   const iteration = exec.scenario.iterationInTest;
   const phase = phaseOf(cohort);
+  const index = pickProfile(cohort, scenario, phase, iteration);
+  if (index < 0) return;
   if (cohort.rate > 0) targetRate.add(cohort.rate, { phase });
-  const index = pickProfile(cohort, iteration);
-  if (index < 0) {
-    exhausted(scenario, phase, iteration);
-    return;
-  }
   const result = postRecap(profiles[index], index, scenario, phase, iteration, false);
   if (pollEveryNth > 0 && iteration % pollEveryNth === 0) {
     pollUntilReady(result, profiles[index]);
@@ -351,11 +358,8 @@ export function user() {
   const scenario = exec.scenario.name;
   const cohort = cohorts[scenario];
   const iteration = exec.scenario.iterationInTest;
-  const index = pickProfile(cohort, iteration);
-  if (index < 0) {
-    exhausted(scenario, PHASE, iteration);
-    return;
-  }
+  const index = pickProfile(cohort, scenario, PHASE, iteration);
+  if (index < 0) return;
   const result = postRecap(profiles[index], index, scenario, PHASE, iteration, true);
   pollUntilReady(result, profiles[index]);
   manifest(result.record);
@@ -449,6 +453,7 @@ export function handleSummary(data) {
     `  post_failures        ${metricLine(data, 'post_failures', 'count')}`,
     `  dropped_iterations   ${metricLine(data, 'dropped_iterations', 'count')}`,
     `  profiles_exhausted   ${metricLine(data, 'profiles_exhausted', 'count')}`,
+    `  iterations_over_quota ${metricLine(data, 'iterations_over_quota', 'count')}`,
     `  post_accept_202 p95  ${metricLine(data, 'post_accept_202', 'p(95)')} ms`,
     `  user_time_to_ready p95 ${metricLine(data, 'user_time_to_ready', 'p(95)')} ms`,
     '',

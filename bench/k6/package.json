@@ -1,0 +1,8 @@
+{
+  "private": true,
+  "type": "module",
+  "description": "Marks bench/k6 as ES modules for node --test; k6 itself ignores this file.",
+  "scripts": {
+    "test": "node --test lib/profiles.test.js"
+  }
+}
