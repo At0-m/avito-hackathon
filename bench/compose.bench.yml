@@ -1,0 +1,294 @@
+# Isolated bench stand for Avito Recap.
+#
+# Always run through bench/run.sh (or the make bench-* targets): it passes
+# -p avito-recap-bench and this file only. The stand does not reuse the dev
+# docker-compose.yml: there are no fixed container_name values, PostgreSQL,
+# ClickHouse, Redpanda and the API are not published on the host, and all
+# volumes belong to the avito-recap-bench project. Only Grafana and
+# VictoriaMetrics are published, on 127.0.0.1 and non-default ports.
+#
+# The service definitions mirror docker-compose.yml; keep images, migrations
+# and topics in sync when the dev stack changes.
+
+name: avito-recap-bench
+
+x-db-env: &db-env
+  DB_HOST: postgres
+  DB_PORT: "5432"
+  DB_USER: avito
+  DB_PASSWORD: avito_password
+  DB_NAME: avito_recap
+  DB_SSLMODE: disable
+
+x-clickhouse-env: &clickhouse-env
+  CLICKHOUSE_URL: http://clickhouse:8123
+  CLICKHOUSE_DATABASE: recap
+  CLICKHOUSE_USER: default
+  CLICKHOUSE_PASSWORD: ""
+
+# The external narrative provider is disabled for every bench profile, even
+# when MISTRAL_API_KEY is exported on the host: no HTTP calls to Mistral, no
+# provider timeout, no retries. The template is the configured source.
+x-narrative-env: &narrative-env
+  NARRATIVE_PROVIDER: disabled
+  MISTRAL_API_KEY: ""
+
+# max_attempts is stamped on each request by the API at creation time, so the
+# API and the workers must use the same value.
+x-retry-env: &retry-env
+  WORKER_MAX_ATTEMPTS: ${BENCH_WORKER_MAX_ATTEMPTS:-3}
+  WORKER_RETRY_BASE: ${BENCH_WORKER_RETRY_BASE:-250ms}
+  WORKER_RETRY_MAX: ${BENCH_WORKER_RETRY_MAX:-1s}
+
+x-redpanda-env: &redpanda-env
+  REDPANDA_HTTP_URL: http://redpanda:8082
+  REDPANDA_COMMAND_TOPIC: recap.generation-commands.v1
+  REDPANDA_LIFECYCLE_TOPIC: recap.lifecycle.v1
+  REDPANDA_DLQ_TOPIC: recap.generation-commands.dlq.v1
+  REDPANDA_CONSUMER_GROUP: recap-workers-v1
+  REDPANDA_HTTP_TIMEOUT: 15s
+
+x-app-image: &app-image avito-recap-bench-app:local
+x-tools-image: &tools-image avito-recap-bench-tools:local
+
+services:
+  postgres:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_USER: avito
+      POSTGRES_PASSWORD: avito_password
+      POSTGRES_DB: avito_recap
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ../backend/migrations/001_postgres_init.sql:/docker-entrypoint-initdb.d/001_postgres_init.sql:ro
+      - ../backend/migrations/002_seed_data.sql:/docker-entrypoint-initdb.d/002_seed_data.sql:ro
+      - ../backend/migrations/003_recap_requests.sql:/docker-entrypoint-initdb.d/003_recap_requests.sql:ro
+      - ../backend/migrations/004_eventing.sql:/docker-entrypoint-initdb.d/004_eventing.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U avito -d avito_recap"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.8
+    environment:
+      CLICKHOUSE_DB: recap
+      CLICKHOUSE_USER: default
+      CLICKHOUSE_PASSWORD: ""
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
+    volumes:
+      - clickhouse_data:/var/lib/clickhouse
+      - ../backend/migrations/clickhouse:/docker-entrypoint-initdb.d:ro
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    healthcheck:
+      test: ["CMD", "clickhouse-client", "--query", "SELECT 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  redpanda:
+    image: docker.redpanda.com/redpandadata/redpanda:${REDPANDA_VERSION:-v26.2.2}
+    command:
+      - redpanda
+      - start
+      - --kafka-addr
+      - internal://0.0.0.0:9092
+      - --advertise-kafka-addr
+      - internal://redpanda:9092
+      - --pandaproxy-addr
+      - internal://0.0.0.0:8082
+      - --advertise-pandaproxy-addr
+      - internal://redpanda:8082
+      - --rpc-addr
+      - redpanda:33145
+      - --advertise-rpc-addr
+      - redpanda:33145
+      - --mode
+      - dev-container
+      - --smp
+      - "1"
+      - --default-log-level=info
+    volumes:
+      - redpanda_data:/var/lib/redpanda/data
+    healthcheck:
+      test: ["CMD", "rpk", "cluster", "info", "-X", "brokers=redpanda:9092"]
+      interval: 10s
+      timeout: 15s
+      retries: 10
+      start_period: 10s
+
+  redpanda-init:
+    image: docker.redpanda.com/redpandadata/redpanda:${REDPANDA_VERSION:-v26.2.2}
+    depends_on:
+      redpanda:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-ec"]
+    command: |
+      rpk topic create --if-not-exists -X brokers=redpanda:9092 --partitions 3 --replicas 1 \
+        recap.generation-commands.v1 recap.lifecycle.v1 recap.generation-commands.dlq.v1
+    restart: "no"
+
+  backend:
+    image: *app-image
+    build:
+      context: ../backend
+      dockerfile: Dockerfile
+    command: ["/app/server"]
+    environment:
+      <<: [*db-env, *clickhouse-env, *narrative-env, *retry-env]
+      SERVER_PORT: "8080"
+      METRICS_ADDR: ":9100"
+      PUBLIC_AVATAR_HOSTS: cdn.example
+      RECAP_POLL_AFTER: ${BENCH_RECAP_POLL_AFTER:-500ms}
+      SSE_POLL_INTERVAL: 250ms
+      SSE_HEARTBEAT_INTERVAL: 10s
+      GIN_MODE: release
+    depends_on:
+      postgres:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+    healthcheck:
+      # A single seeded profile: GET /profiles would list every bench profile.
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8080/api/v1/profiles/11111111-1111-1111-1111-111111111111"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    restart: on-failure
+
+  outbox:
+    image: *app-image
+    pull_policy: never
+    init: true
+    command: ["/app/outbox"]
+    environment:
+      <<: [*db-env, *redpanda-env]
+      METRICS_ADDR: ":9100"
+      OUTBOX_POLL_INTERVAL: ${BENCH_OUTBOX_POLL_INTERVAL:-250ms}
+      OUTBOX_LEASE_DURATION: 15s
+      OUTBOX_BATCH_SIZE: ${BENCH_OUTBOX_BATCH_SIZE:-50}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redpanda-init:
+        condition: service_completed_successfully
+      backend:
+        condition: service_started
+    restart: unless-stopped
+
+  worker:
+    image: *app-image
+    pull_policy: never
+    init: true
+    stop_grace_period: 20s
+    command: ["/app/worker"]
+    environment:
+      <<: [*db-env, *clickhouse-env, *narrative-env, *retry-env, *redpanda-env]
+      METRICS_ADDR: ":9100"
+      PUBLIC_AVATAR_HOSTS: cdn.example
+      WORKER_COMMAND_SOURCE: ${BENCH_COMMAND_SOURCE:-broker}
+      WORKER_POLL_INTERVAL: ${BENCH_WORKER_POLL_INTERVAL:-500ms}
+      # Lease and heartbeat keep the dev defaults; they are separate from the
+      # retry backoff. See bench/README.md before shortening them.
+      WORKER_LEASE_DURATION: ${BENCH_WORKER_LEASE_DURATION:-30s}
+      WORKER_HEARTBEAT_INTERVAL: ${BENCH_WORKER_HEARTBEAT_INTERVAL:-10s}
+      WORKER_SHUTDOWN_TIMEOUT: 15s
+    depends_on:
+      postgres:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+      redpanda-init:
+        condition: service_completed_successfully
+      outbox:
+        condition: service_started
+    restart: unless-stopped
+
+  # One PostgreSQL sampler per stand (queue depth, age, outbox, table sizes).
+  sampler:
+    image: *tools-image
+    build:
+      context: ../backend
+      dockerfile: Dockerfile.bench
+    command: ["bench-sampler", "--interval", "5s"]
+    environment:
+      <<: *db-env
+      DATABASE_URL: postgres://avito:avito_password@postgres:5432/avito_recap?sslmode=disable
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  victoriametrics:
+    image: victoriametrics/victoria-metrics:v1.106.1
+    command:
+      - -storageDataPath=/storage
+      - -retentionPeriod=30d
+      - -httpListenAddr=:8428
+      - -promscrape.config=/etc/victoriametrics/scrape.yml
+      - -search.latencyOffset=5s
+    volumes:
+      - vm_data:/storage
+      - ./vm/scrape.yml:/etc/victoriametrics/scrape.yml:ro
+    ports:
+      - "127.0.0.1:${BENCH_VM_PORT:-18428}:8428"
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:11.3.1
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: ${BENCH_GRAFANA_PASSWORD:-bench}
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_USERS_DEFAULT_THEME: light
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports:
+      - "127.0.0.1:${BENCH_GRAFANA_PORT:-13000}:3000"
+    depends_on:
+      - victoriametrics
+    restart: unless-stopped
+
+  # One-shot utilities (seed, preflight, wait, reconcile, report).
+  tools:
+    image: *tools-image
+    pull_policy: never
+    profiles: ["tools"]
+    user: "${BENCH_UID:-1000}:${BENCH_GID:-1000}"
+    working_dir: /results
+    environment:
+      DATABASE_URL: postgres://avito:avito_password@postgres:5432/avito_recap?sslmode=disable
+      CLICKHOUSE_URL: http://clickhouse:8123
+      VM_URL: http://victoriametrics:8428
+    volumes:
+      - ./results:/results
+
+  k6:
+    image: grafana/k6:0.54.0
+    profiles: ["tools"]
+    user: "${BENCH_UID:-1000}:${BENCH_GID:-1000}"
+    environment:
+      K6_PROMETHEUS_RW_SERVER_URL: http://victoriametrics:8428/api/v1/write
+      K6_PROMETHEUS_RW_PUSH_INTERVAL: 5s
+      K6_PROMETHEUS_RW_TREND_STATS: p(50),p(95),p(99),max,count
+      K6_NO_USAGE_REPORT: "true"
+      BASE_URL: http://backend:8080/api/v1
+    volumes:
+      - ./k6:/scripts:ro
+      - ./results:/results
+
+volumes:
+  postgres_data:
+  clickhouse_data:
+  redpanda_data:
+  vm_data:
+  grafana_data:
