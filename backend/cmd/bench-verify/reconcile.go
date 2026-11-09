@@ -72,6 +72,8 @@ type ReconcileResult struct {
 	PostsByScenario    map[string]int `json:"posts_by_scenario"`
 	PostsByPhase       map[string]int `json:"posts_by_phase"`
 	GeneratorExhausted int            `json:"generator_exhausted"`
+	// Iterations started after the quota was complete; no POST, not an error.
+	IterationsOverQuota int `json:"iterations_over_quota"`
 	Kinds              map[string]int `json:"kinds"`
 	HTTPStatuses       map[string]int `json:"http_statuses"`
 
@@ -142,6 +144,10 @@ func Reconcile(entries []Entry, state DBState, options ReconcileOptions) Reconci
 	for _, entry := range entries {
 		if entry.Kind == KindExhausted {
 			result.GeneratorExhausted++
+			continue
+		}
+		if entry.Kind == KindOverQuota {
+			result.IterationsOverQuota++
 			continue
 		}
 		result.PostsSent++

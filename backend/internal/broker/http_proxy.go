@@ -226,12 +226,17 @@ func (c *HTTPConsumer) Commit(ctx context.Context, records []Record) error {
 		topic     string
 		partition int
 	}
+	// The Redpanda HTTP Proxy (Confluent REST v2 semantics) expects the offset
+	// of the last processed record and resumes the group at committed+1.
+	// Committing record.Offset+1 made every reassigned partition skip one
+	// record (or fetch past the high watermark and reset to earliest).
+	// If a proxy resumed at the committed offset instead, the last record
+	// would be redelivered once, which the consumed_events inbox absorbs.
 	latest := make(map[key]int64)
 	for _, record := range records {
 		item := key{topic: record.Topic, partition: record.Partition}
-		next := record.Offset + 1
-		if current, ok := latest[item]; !ok || next > current {
-			latest[item] = next
+		if current, ok := latest[item]; !ok || record.Offset > current {
+			latest[item] = record.Offset
 		}
 	}
 	partitions := make([]commitPartition, 0, len(latest))

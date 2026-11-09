@@ -8,10 +8,12 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"recap-personalization/internal/eventing"
 	"recap-personalization/internal/model"
 	recap "recap-personalization/internal/recap"
 	"recap-personalization/internal/repository"
 	"recap-personalization/internal/service"
+	"recap-personalization/internal/telemetry"
 )
 
 type fakeQueue struct {
@@ -310,6 +312,89 @@ func TestReachableRetryDelaysWithThreeAttempts(t *testing.T) {
 				t.Fatal("third attempt must be marked failed and retryable")
 			}
 		})
+	}
+}
+
+type claimOnceQueue struct {
+	fakeQueue
+	request *model.RecapRequest
+}
+
+func (q *claimOnceQueue) ClaimNextRecapRequest(context.Context, string, time.Duration) (*model.RecapRequest, error) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if q.request == nil {
+		return nil, repository.ErrRecapRequestNotFound
+	}
+	request := q.request
+	q.request = nil
+	return request, nil
+}
+
+type recordingPublisher struct {
+	mu     sync.Mutex
+	stages []string
+	// calls accumulated for the attempt when the ready event is published
+	callsBeforeReady int
+}
+
+func (p *recordingPublisher) PublishLifecycle(ctx context.Context, value eventing.RecapLifecycleV1) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.stages = append(p.stages, value.Stage)
+	if value.Stage == "ready" {
+		p.callsBeforeReady, _, _, _ = telemetry.LifecycleTotals(ctx)
+	}
+	return nil
+}
+
+func (p *recordingPublisher) PublishFailedCommand(context.Context, eventing.FailedCommandV1) error {
+	return nil
+}
+
+// Successful path: starting (before the attempt timer), five progress
+// publications (inside it, emitted by the service), ready (after it).
+func TestSuccessfulAttemptCountsLifecyclePublications(t *testing.T) {
+	queue := &claimOnceQueue{request: testRequest(1, 3)}
+	publisher := &recordingPublisher{}
+	progress := []string{"loading_activity", "computing_features", "personalizing", "generating_narrative", "persisting_snapshot"}
+	runner := NewRunner(queue, processorFunc(func(ctx context.Context, request *model.RecapRequest, _ string) error {
+		for index, stage := range progress {
+			event := eventing.NewLifecycle(request.ID, model.RecapRequestProcessing, stage, 15+index*20, request.AttemptCount)
+			if err := telemetry.TimeLifecyclePublish(ctx, telemetry.LifecycleProgress, func() error {
+				return publisher.PublishLifecycle(ctx, event)
+			}); err != nil {
+				return err
+			}
+		}
+		return nil
+	}), Config{WorkerID: "test"})
+	runner.SetEventPublisher(publisher)
+
+	readyBefore := telemetry.AttemptLifecycleCalls.Count(telemetry.LifecycleScopeAll, telemetry.AttemptReady)
+	attemptsBefore := telemetry.WorkerAttemptDuration.Count(telemetry.AttemptReady)
+	handled, err := runner.ProcessNext(context.Background())
+	if err != nil || !handled {
+		t.Fatalf("handled=%v err=%v", handled, err)
+	}
+	want := append(append([]string{"starting"}, progress...), "ready")
+	if len(publisher.stages) != len(want) {
+		t.Fatalf("stages=%v, want %v", publisher.stages, want)
+	}
+	for index := range want {
+		if publisher.stages[index] != want[index] {
+			t.Fatalf("stages=%v, want %v", publisher.stages, want)
+		}
+	}
+	// starting + 5 progress were accumulated before ready was published.
+	if publisher.callsBeforeReady != 6 {
+		t.Fatalf("calls accumulated before ready=%d, want 6", publisher.callsBeforeReady)
+	}
+	if telemetry.AttemptLifecycleCalls.Count(telemetry.LifecycleScopeAll, telemetry.AttemptReady) != readyBefore+1 {
+		t.Fatal("per-attempt lifecycle aggregate must be observed once")
+	}
+	if telemetry.WorkerAttemptDuration.Count(telemetry.AttemptReady) != attemptsBefore+1 {
+		t.Fatal("fine attempt histogram must be observed once")
 	}
 }
 

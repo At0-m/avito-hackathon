@@ -159,7 +159,8 @@ type metricsResult struct {
 	Window          string               `json:"window,omitempty"`
 	TargetsUp       map[string]int       `json:"targets_up"`
 	TargetsExpected map[string]int       `json:"targets_expected"`
-	StaleSeconds    map[string]jsonFloat `json:"max_scrape_age_seconds"`
+	StaleSeconds    map[string]jsonFloat `json:"min_scrape_age_seconds"`
+	StaleSeries     map[string]int       `json:"stale_target_series"`
 	K6Series        int                  `json:"k6_series_for_testid"`
 	K6Required      bool                 `json:"k6_series_required"`
 	ActiveConsumers int                  `json:"active_broker_consumers"`
@@ -332,13 +333,25 @@ func collectMetrics(client vmClient, expected map[string]int, testID string, sta
 		NarrativeOutcomes: map[string]jsonFloat{}, WorkerAttempts: map[string]jsonFloat{},
 		ConsumerResets: map[string]jsonFloat{}, K6Required: testID != "",
 	}
-	up, err := client.byLabel(`sum by (job) (up == 1)`, "job", end)
+	// Only targets scraped within maxAge count as live. A recreated container
+	// gets a new IP; the series of the old instance stays visible within the
+	// query lookback and must neither be counted nor fail the freshness check.
+	fresh := fmt.Sprintf(`(time() - timestamp(up)) <= %g and up == 1`, maxAge.Seconds())
+	up, err := client.byLabel(`count by (job) (`+fresh+`)`, "job", end)
 	if err != nil {
 		return result, err
 	}
-	ages, err := client.byLabel(`max by (job) (time() - timestamp(up))`, "job", end)
+	ages, err := client.byLabel(`min by (job) (time() - timestamp(up))`, "job", end)
 	if err != nil {
 		return result, err
+	}
+	stale, err := client.byLabel(fmt.Sprintf(`count by (job) ((time() - timestamp(up)) > %g)`, maxAge.Seconds()), "job", end)
+	if err != nil {
+		return result, err
+	}
+	result.StaleSeries = map[string]int{}
+	for job, count := range stale {
+		result.StaleSeries[job] = int(count)
 	}
 	jobs := make([]string, 0, len(expected))
 	for job := range expected {
@@ -353,10 +366,7 @@ func collectMetrics(client vmClient, expected map[string]int, testID string, sta
 		}
 		result.StaleSeconds[job] = jsonFloat(age)
 		if int(up[job]) != expected[job] {
-			result.Problems = append(result.Problems, fmt.Sprintf("job %s: %d live targets, expected %d", job, int(up[job]), expected[job]))
-		}
-		if expected[job] > 0 && (math.IsNaN(age) || age > maxAge.Seconds()) {
-			result.Problems = append(result.Problems, fmt.Sprintf("job %s: last scrape is older than %s", job, maxAge))
+			result.Problems = append(result.Problems, fmt.Sprintf("job %s: %d live targets scraped within %s, expected %d", job, int(up[job]), maxAge, expected[job]))
 		}
 	}
 	if testID != "" {

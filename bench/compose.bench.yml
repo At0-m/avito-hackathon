@@ -112,6 +112,11 @@ services:
       - --smp
       - "1"
       - --default-log-level=info
+      # HTTP Proxy produce batching delay (broker/node property, read only at
+      # broker start). Default 100 equals the Redpanda default, so runs that
+      # do not set it are unchanged. A/B: 100 (A) vs 5 (B), see bench/README.md.
+      - --set
+      - pandaproxy_client.produce_batch_delay_ms=${BENCH_PANDAPROXY_PRODUCE_BATCH_DELAY_MS:-100}
     volumes:
       - redpanda_data:/var/lib/redpanda/data
     healthcheck:
@@ -126,10 +131,24 @@ services:
     depends_on:
       redpanda:
         condition: service_healthy
-    entrypoint: ["/bin/sh", "-ec"]
-    command: |
-      rpk topic create --if-not-exists -X brokers=redpanda:9092 --partitions 3 --replicas 1 \
-        recap.generation-commands.v1 recap.lifecycle.v1 recap.generation-commands.dlq.v1
+    # Exec form only. With entrypoint ["/bin/sh", "-ec"] and a string command,
+    # Compose splits the string into argv, sh runs bare "rpk" (the rest become
+    # $0, $1, ...), prints the rpk help and exits 0 without creating topics.
+    # bench/run.sh verifies topics, partitions and leaders independently.
+    entrypoint: ["rpk"]
+    command:
+      - topic
+      - create
+      - recap.generation-commands.v1
+      - recap.lifecycle.v1
+      - recap.generation-commands.dlq.v1
+      - --if-not-exists
+      - --partitions
+      - "3"
+      - --replicas
+      - "1"
+      - -X
+      - brokers=redpanda:9092
     restart: "no"
 
   backend:
@@ -230,6 +249,9 @@ services:
       - -retentionPeriod=30d
       - -httpListenAddr=:8428
       - -promscrape.config=/etc/victoriametrics/scrape.yml
+      # Replaces per-job refresh_interval (not supported in dns_sd_configs):
+      # new worker/outbox replica IPs are picked up within 5 s instead of 30 s.
+      - -promscrape.dnsSDCheckInterval=5s
       - -search.latencyOffset=5s
     volumes:
       - vm_data:/storage

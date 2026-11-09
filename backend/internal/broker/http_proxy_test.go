@@ -34,7 +34,7 @@ func TestHTTPProxyPublish(t *testing.T) {
 	}
 }
 
-func TestHTTPConsumerLifecycleAndCommitNextOffset(t *testing.T) {
+func TestHTTPConsumerLifecycleAndCommitLastProcessedOffset(t *testing.T) {
 	var commitBody []byte
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		switch {
@@ -80,11 +80,51 @@ func TestHTTPConsumerLifecycleAndCommitNextOffset(t *testing.T) {
 	if err := json.Unmarshal(commitBody, &payload); err != nil {
 		t.Fatalf("decode commit: %v", err)
 	}
-	if len(payload.Partitions) != 1 || payload.Partitions[0].Offset != 10 {
-		t.Fatalf("commit must store the next offset: %+v", payload.Partitions)
+	// Redpanda HTTP Proxy resumes at committed+1, so the commit carries the
+	// offset of the last processed record, not the next one.
+	if len(payload.Partitions) != 1 || payload.Partitions[0].Offset != 9 {
+		t.Fatalf("commit must store the last processed offset: %+v", payload.Partitions)
 	}
 	if err := consumer.Close(context.Background()); err != nil {
 		t.Fatalf("close: %v", err)
+	}
+}
+
+func TestHTTPConsumerCommitsHighestOffsetPerPartition(t *testing.T) {
+	var commitBody []byte
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		commitBody, _ = io.ReadAll(request.Body)
+		writer.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+
+	consumer := &HTTPConsumer{proxy: NewHTTPProxy(server.URL, time.Second), baseURI: server.URL}
+	err := consumer.Commit(context.Background(), []Record{
+		{Topic: "commands", Partition: 1, Offset: 4},
+		{Topic: "commands", Partition: 0, Offset: 7},
+		{Topic: "commands", Partition: 1, Offset: 6},
+		{Topic: "commands", Partition: 1, Offset: 5},
+	})
+	if err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+	var payload struct {
+		Partitions []commitPartition `json:"partitions"`
+	}
+	if err := json.Unmarshal(commitBody, &payload); err != nil {
+		t.Fatalf("decode commit: %v", err)
+	}
+	want := []commitPartition{
+		{Topic: "commands", Partition: 0, Offset: 7},
+		{Topic: "commands", Partition: 1, Offset: 6},
+	}
+	if len(payload.Partitions) != len(want) {
+		t.Fatalf("partitions=%+v, want %+v", payload.Partitions, want)
+	}
+	for index := range want {
+		if payload.Partitions[index] != want[index] {
+			t.Fatalf("partitions=%+v, want %+v", payload.Partitions, want)
+		}
 	}
 }
 

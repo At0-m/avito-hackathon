@@ -67,9 +67,40 @@ make bench-down          # остановить контейнеры стенд�
 make bench-clean         # удалить контейнеры, сеть, volumes и образы ТОЛЬКО проекта avito-recap-bench
 ```
 
-Каждый сценарий сам собирает и поднимает стенд (`docker compose build` + `up -d --wait --scale worker=N`). Затем он ждёт, пока в VictoriaMetrics появятся живые targets `api=1, outbox=1, worker=N, sampler=1` и активные consumers Redpanda в каждом worker. После этого сценарий снимает окружение, генерирует свежий детерминированный набор данных с новым `SEED` (по умолчанию текущее время Unix) и выполняет preflight. Preflight проверяет, что каждый профиль на месте, у каждого ровно `EVENTS_PER_PROFILE` событий в ClickHouse, для когорты нет старых работ и snapshots, а системная очередь пуста.
+Каждый сценарий сам собирает и поднимает стенд (`docker compose build` + `up -d --wait --scale worker=N`). Сразу после этого, до `stand_ready`, seed и k6, выполняется обязательная проверка топиков: `recap.generation-commands.v1`, `recap.lifecycle.v1` и `recap.generation-commands.dlq.v1` должны существовать, у каждого должно быть 3 партиции с назначенным лидером (`rpk topic describe -p`, ожидание до `BENCH_TOPIC_WAIT_S=60` с). Код выхода `redpanda-init` на веру не принимается. При провале запуск завершается с ненулевым кодом, а `redpanda-init.log`, `redpanda-init-ps.txt`, `topics.txt` и `topics-describe.txt` сохраняются в каталог прогона. Если топик уже был создан producer'ом с одной партицией (старый volume), `--if-not-exists` его не исправит — нужен `BENCH_RESET=1`. Затем сценарий ждёт, пока в VictoriaMetrics появятся живые targets `api=1, outbox=1, worker=N, sampler=1` и активные consumers Redpanda в каждом worker. В режимах broker/hybrid сценарий также ждёт (до `BENCH_GROUP_WAIT_S=360` с), пока в группе `recap-workers-v1` будет ровно `WORKERS` членов. Состав группы сохраняется в `group-start.txt` и `group-end.txt`, а отчёт проверяет число членов (см. «Устаревшие consumers HTTP Proxy»). После этого сценарий снимает окружение, генерирует свежий детерминированный набор данных с новым `SEED` (по умолчанию текущее время Unix) и выполняет preflight. Preflight проверяет, что каждый профиль на месте, у каждого ровно `EVENTS_PER_PROFILE` событий в ClickHouse, для когорты нет старых работ и snapshots, а системная очередь пуста.
 
 Exit code: `0` — все проверки пройдены, иначе не ноль. Отчёт сохраняется в любом случае. Повторить прогон на тех же данных можно с прежним `SEED`, но тогда preflight укажет, что когорта уже тёплая. Чистое состояние перед прогоном даёт `BENCH_RESET=1`: стенд пересоздаёт только свои volumes.
+
+### Режимы старта стенда
+
+| Режим | Что делает | `STAND_MODE` в `run.env` |
+|---|---|---|
+| по умолчанию | `docker compose build` + `up -d --wait`: пересоздаёт изменённые контейнеры и запускает `redpanda-init`, затем проверяет топики | `fresh` |
+| `BENCH_RESET=1` | то же, но сначала удаляет volumes проекта `avito-recap-bench`: чистые PG, CH, Redpanda, VM | `reset` |
+| `BENCH_REUSE=1` | работает на уже поднятых контейнерах: без build, без recreate, без повторного `redpanda-init` | `reuse` |
+
+`BENCH_REUSE=1` и `BENCH_RESET=1` взаимоисключающие (exit 2). В режиме reuse до seed и k6 выполняются обязательные проверки, и любой провал завершает сценарий с exit 1:
+
+1. Запущены postgres, clickhouse, redpanda, backend, outbox, sampler и victoriametrics. postgres, clickhouse, redpanda и backend — в статусе `healthy`.
+2. Работает ровно `WORKERS` реплик worker, и у каждой `WORKER_COMMAND_SOURCE` совпадает с `BENCH_COMMAND_SOURCE`.
+3. Kafka API `redpanda:9092` отвечает из bench-сети: отдельный одноразовый контейнер `rpk cluster info`, вывод в `kafka-check.txt`. HTTP Proxy `redpanda:8082/brokers` отвечает из контейнера `tools`.
+4. Есть три топика, по 3 партиции с лидером у каждой (та же проверка, что при обычном старте).
+5. VictoriaMetrics видит свежие targets `api=1, outbox=1, worker=WORKERS, sampler=1` и активные consumers во всех worker (ожидание до `BENCH_REUSE_METRICS_WAIT=60s`).
+
+При провале диагностика сохраняется в `bench/results/<run-id>/reuse-check/`: `compose-ps.txt`, `containers.txt`, `services-tail.log`, `rpk-cluster-info.txt`, `topics.txt`, `group.txt`. Проверка топиков пишет свои файлы в каталог прогона. Типичная причина провала — worker, остановленный прерванным hotkey/backlog: поднимите стенд заново обычным запуском.
+
+Данные прошлых прогонов в режиме reuse остаются. Свежий `SEED` даёт новую холодную когорту, а preflight проверяет, что системная очередь пуста. Ряды в VictoriaMetrics разделяются по `testid`.
+
+Smoke на чистом стенде, затем steady на тех же контейнерах:
+
+```bash
+BENCH_RESET=1 make bench-mvp-smoke     # чистые volumes, build, redpanda-init, проверка топиков
+make bench-status                      # контейнеры работают, worker x3
+BENCH_REUSE=1 make bench-steady        # те же контейнеры: проверки, затем seed и k6
+less "$(ls -td bench/results/*-steady | head -n 1)/summary.md"
+```
+
+Для hotkey и backlog reuse тоже работает: сценарий сам останавливает и запускает workers. Если такой сценарий был прерван, следующий запуск с `BENCH_REUSE=1` остановится на проверке числа workers.
 
 ## Сценарии
 
@@ -80,6 +111,8 @@ Exit code: `0` — все проверки пройдены, иначе не н�
 Проверяется: 100 подтверждённых работ, 100 новых 202, 100 ready со связанным snapshot нужного профиля и года. Пропавших подтверждений, неожиданных failed, дублей и 200 у холодной когорты быть не должно. Manifest должен совпадать со счётчиком k6, targets всех worker и ряды k6 должны быть в VM, narrative — template при отключённом provider.
 
 Параметры: `SMOKE_COUNT=100`, `SMOKE_RATE=5`, `SMOKE_POLL_EVERY_NTH=10`, `WORKERS=3`.
+
+Квота и исчерпание различаются. `constant-arrival-rate` (5/с × 20 с) может стартовать ещё одну итерацию на границе окна (`iterationInTest = 100`). Такая итерация не отправляет POST и учитывается в `iterations_over_quota` (manifest `k: "over_quota"`): квота выполнена, это не ошибка. `profiles_exhausted` растёт, только если для запланированного POST (`iteration < quota`) нет подготовленного профиля, — это «нагрузка не достигнута». Smoke проверяет оба условия: `profiles_exhausted = 0` и ровно `SMOKE_COUNT` POST. Правила выбора профиля лежат в `bench/k6/lib/profiles.js`, регрессионный тест граничного индекса — `node --test bench/k6/lib/profiles.test.js`.
 
 ### Steady cold — `make bench-steady`
 
@@ -139,7 +172,7 @@ Workers работают весь тест, пары профиль/год но�
 
 ### Общие параметры
 
-`WORKERS=3`, `BENCH_COMMAND_SOURCE=broker` (`database` или `hybrid` для сравнений), `EVENTS_PER_PROFILE=50`, `YEAR=2026`, `SEED`, `RUN_ID`, `TESTID`, `DRAIN_DEADLINE=600s`, `BENCH_RESET=0`, `BENCH_STATS_INTERVAL=5`, `BENCH_PROJECT=avito-recap-bench`.
+`WORKERS=3`, `BENCH_COMMAND_SOURCE=broker` (`database` или `hybrid` для сравнений), `EVENTS_PER_PROFILE=50`, `YEAR=2026`, `SEED`, `RUN_ID`, `TESTID`, `DRAIN_DEADLINE=600s`, `BENCH_RESET=0`, `BENCH_REUSE=0`, `BENCH_REUSE_METRICS_WAIT=60s`, `BENCH_STATS_INTERVAL=5`, `BENCH_GROUP_WAIT_S=360`, `BENCH_PROJECT=avito-recap-bench`.
 
 ## Где лежат результаты
 
@@ -227,7 +260,7 @@ Cap 30 с в dev недостижим: он сработал бы только �
 | Retry публикации outbox | `internal/outbox/publisher.go` | 1 с, удвоение до 30 с, попытки не ограничены. `RetryBase/RetryMax` не читаются из env: `cmd/outbox` их не передаёт | Только при ошибке публикации, то есть при недоступности или ошибке Redpanda. В шести сценариях отказов брокера нет | Не менялось. Эффективные значения экспортируются (`recap_config_value{param="outbox_retry_*"}`), задержки видны на dashboard (outbox retry delay, `publish requeued`). Понадобится на этапе fault-тестов |
 | Переподключение consumer | `cmd/worker/main.go` | ошибка или создание — 1 с; `ErrCommandDeferred` — 250 мс и **пересоздание consumer**, то есть новый член группы и rebalance | Deferred возникает, когда команда пришла для работы с живой lease у другого worker: в hybrid при гонке с опросом PG или после kill до истечения lease. В broker-режиме без kill не ожидается | Не менялось (константы), счётчик `recap_broker_consumer_restarts_total{reason}`. Bench по умолчанию использует broker. Hybrid даёт дополнительные rebalance — это нужно учитывать при A/B |
 | Истечение lease после kill worker | `recap_requests.lease_expires_at` | lease 30 с, heartbeat 10 с: работа «висит» 20–30 с после kill (с последнего heartbeat) | В MVP workers останавливаются штатно (SIGTERM) и без работ в процессе, поэтому lease не участвует | Lease не сокращён. **После kill worker основное ожидание даёт lease**: в broker-режиме переотправленная команда уходит в deferred-цикл до истечения lease, в database/hybrid `ClaimNextRecapRequest` подбирает истёкшую lease. Если для fault-этапа нужен короткий bench-lease (`BENCH_WORKER_LEASE_DURATION`/`BENCH_WORKER_HEARTBEAT_INTERVAL`), держите lease ≥ 3 × heartbeat с запасом на задержку UPDATE heartbeat под нагрузкой, например 6s/2s. Длительность живой попытки ограничений не задаёт, потому что heartbeat продлевает lease. `normalizeConfig` проверяет только heartbeat < lease |
-| Consumer HTTP proxy после kill -9 | Redpanda Pandaproxy | сессия мёртвого члена группы держит партиции до таймаута | только kill-сценарии | Не проверялось; проверить на этапе fault |
+| Устаревший consumer HTTP Proxy | Redpanda Pandaproxy, `pandaproxy.consumer_instance_timeout_ms=300000` | экземпляр, который не удалили через `DELETE`, остаётся членом группы до 5 мин и держит назначенные партиции | да: так было на smoke 2026-11-09 (см. ниже) | Worker теперь штатно закрывает consumer при SIGTERM. Стенд ждёт `MEMBERS == WORKERS` перед нагрузкой. После kill -9 ожидание до 5 мин остаётся, это предмет fault-этапа |
 | Таймаут Mistral | `MISTRAL_TIMEOUT=15s` | — | нет: provider отключён | — |
 | HTTP-таймауты и polling | k6 `POST_TIMEOUT_S=10`, `REDPANDA_HTTP_TIMEOUT=15s`, `RECAP_POLL_AFTER=500ms` | — | отдельные механизмы | Не уменьшались вместе с backoff |
 
@@ -241,14 +274,129 @@ Endpoint `/metrics` включается переменной `METRICS_ADDR` (в
 |---|---|
 | API | `recap_http_requests_total`, `recap_http_request_duration_seconds` (route template), `recap_create_outcomes_total{outcome=created/existing_request/snapshot_hit/restarted_failed/error}` |
 | worker | `recap_worker_claims_total{source}`, `recap_worker_queue_wait_seconds`, `recap_worker_attempt_results_total{result}`, `recap_worker_failures_total{code}`, `recap_worker_retry_delay_seconds`, `recap_worker_stage_duration_seconds{stage=activity_read/generate/pg_finalize/attempt}`, `recap_worker_busy`, `recap_worker_expired_lease_failed_total`, `recap_event_publish_total{kind,result}`, `recap_broker_consumer_active`, `recap_broker_consumer_restarts_total`, `recap_narrative_*` |
-| outbox | `recap_outbox_claimed_total`, `recap_outbox_publish_total{result}`, `recap_outbox_publish_duration_seconds`, `recap_outbox_retry_delay_seconds` |
+| outbox | `recap_outbox_claimed_total`, `recap_outbox_publish_total{result}`, `recap_outbox_publish_duration_seconds`, `recap_outbox_record_duration_seconds{result}`, `recap_outbox_retry_delay_seconds` |
+| worker, lifecycle | `recap_worker_lifecycle_publish_duration_seconds{phase,result}`, `recap_worker_attempt_lifecycle_calls{scope,result}`, `recap_worker_attempt_lifecycle_seconds{scope,result}`, `recap_worker_attempt_duration_seconds{result}` |
 | все Go-процессы | `go_goroutines`, `go_gc_heap_live_bytes` (heap после GC), `process_resident_memory_bytes`, `process_cpu_seconds_total`, `process_start_time_seconds`, `go_sql_*` (in use, idle, wait count/duration), `recap_config_value{param}` |
 | sampler (PG, раз в 5 с) | `recap_bench_requests{status}`, `recap_bench_backlog`, `recap_bench_oldest_*_age_seconds`, `recap_bench_delayed_retries`, `recap_bench_expired_leases`, `recap_bench_outbox{status}`, `recap_bench_outbox_oldest_unpublished_age_seconds`, `recap_bench_failed{error_code}`, размеры таблиц, `recap_bench_sampler_up`, `recap_bench_sampler_last_success_timestamp_seconds` |
 | k6 (remote write) | `k6_posts_started_total`, `k6_target_post_rate`, `k6_dropped_iterations_total`, `k6_post_accept_202_p95`, `k6_posts_accepted_202_total`, `k6_posts_ready_200_total`, `k6_post_failures_total`, `k6_user_time_to_ready_p95`, … с тегами `testid`, `scenario`, `phase` (системный тег `url` отключён) |
 
-Реплики worker обнаруживаются через Docker DNS (`dns_sd_configs` по имени сервиса). Число живых `up{job="worker"}` сравнивается с `WORKERS` до и после нагрузки. При сбое выборки sampler выставляет `recap_bench_sampler_up=0` и не отдаёт устаревшие значения.
+Реплики worker обнаруживаются через Docker DNS (`dns_sd_configs` по имени сервиса). VictoriaMetrics не принимает `refresh_interval` внутри `dns_sd_configs`, поэтому период перерезолва задаётся флагом `-promscrape.dnsSDCheckInterval=5s`. Живым считается target, который отскрейплен не позже 20 с назад (`--max-scrape-age`), и такие targets сравниваются с `WORKERS` до и после нагрузки. Ряды старого контейнера с прежним IP ещё видны в окне lookback, но не считаются и не валят проверку. Их число пишется в `stale_target_series`. При сбое выборки sampler выставляет `recap_bench_sampler_up=0` и не отдаёт устаревшие значения.
 
-Dashboards (`bench/grafana/dashboards`): «Вход и результат» и «Где образовалась очередь». Lag Redpanda считается из `/public_metrics` (`redpanda_kafka_max_offset − redpanda_kafka_consumer_group_committed_offset`). «No data» означает недоступную метрику, а не нулевой lag.
+Dashboards (`bench/grafana/dashboards`): «Вход и результат» и «Где образовалась очередь». Lag Redpanda считается из `/public_metrics` (`redpanda_kafka_max_offset − redpanda_kafka_consumer_group_committed_offset`). «No data» означает недоступную метрику, а не нулевой lag. Worker коммитит offset последней обработанной записи (семантика HTTP Proxy). Поэтому в `rpk group describe` у догнавшей партиции `CURRENT-OFFSET = LOG-END-OFFSET − 1` и `LAG = 1`; на графике это смещение тоже может быть видно.
+
+### Как читать панели outbox и lifecycle
+
+Панели 13–17 на dashboard «Где образовалась очередь» добавлены после steady `20261109T193855Z-steady`: 20 POST/с, 3 worker, broker. Там около 3,7 ready/с, большая часть принятых работ ещё не опубликована outbox, а p95 попытки стоит на ровных 975 мс.
+
+| Метрика | Таймер стартует | Таймер останавливается | Что не входит |
+|---|---|---|---|
+| `recap_outbox_publish_duration_seconds` (была) | перед `producer.Publish` | после ответа HTTP Proxy | JSON-разбор payload, UPDATE в PG |
+| `recap_outbox_record_duration_seconds{result=published\|requeued\|error}` (новая) | перед `MarkOutboxEventPublished` / `RequeueOutboxEvent` | после UPDATE | HTTP-публикация |
+| `recap_worker_stage_duration_seconds{stage="attempt"}` (была, buckets не менялись) | после lifecycle `starting`, перед запуском heartbeat | после `ProcessRecapRequest` и остановки heartbeat | claim, `starting`, `ready`/`requeued`/`failed`, inbox и commit |
+| `recap_worker_attempt_duration_seconds{result}` (новая) | те же границы, что у `stage="attempt"` | те же | — |
+| `recap_worker_lifecycle_publish_duration_seconds{phase,result}` (новая) | перед `PublishLifecycle` | после ответа HTTP Proxy | — |
+| `recap_worker_attempt_lifecycle_calls` / `_seconds{scope,result}` (новые) | накопление с `starting` | наблюдение один раз после последней публикации попытки (`ready`/`requeued`/`failed`) | — |
+
+Успешная попытка делает 7 синхронных lifecycle-публикаций:
+
+- `starting` — до таймера попытки;
+- 5 × progress внутри таймера: `loading_activity`, `computing_features`, `personalizing`, `generating_narrative`, `persisting_snapshot`. Каждый progress — это ещё и UPDATE `recap_requests` в PG; этот UPDATE отдельно не замеряется;
+- `ready` — после таймера.
+
+`scope=attempt_timer` — это 5 progress-публикаций, `scope=all` — все 7.
+
+- **Панели 13–14 (outbox).** Отдельно показаны среднее и p95 HTTP-публикации и записи результата в PG на одно событие. Ещё одна панель показывает события/с и «занятость» = `rate(publish _sum) + rate(record _sum)` секунд работы в секунду. Outbox публикует события по одному, так что занятость около 1 означает, что последовательный цикл ограничивает скорость публикации.
+- **Панели 15–16 (worker).** Число lifecycle-вызовов и их суммарное время на одну попытку с `result=ready` (среднее и p95), а рядом — попытка целиком на мелких buckets. Это разные распределения: p95 одного нельзя вычитать из p95 другого. Сравнивать можно средние, потому что среднее суммы равно сумме средних.
+- **Панель 17.** Одна публикация по фазам: среднее, p95 и ошибки/с.
+- **Полка 975 мс.** Buckets `stage="attempt"` идут …0.25, 0.5, 1, 2.5…. Если все попытки в окне попадают в (0.5, 1], линейная интерполяция `histogram_quantile` даёт ровно 0.5 + 0.95 · 0.5 = 0.975 при любом реальном распределении внутри корзины. Поэтому 975 мс означает только «p95 между 0,5 и 1 с», точность — ширина корзины, 500 мс. Существующие buckets оставлены для сравнения с исходным прогоном. Точное значение даёт `recap_worker_attempt_duration_seconds` с шагом 0,1 с в этом диапазоне.
+
+Новые метрики не меняют поведение: та же concurrency, тот же размер пачки outbox, те же retries, порядок публикаций, commit и режим worker. Новый прогон с теми же переменными сравним с исходным по прежним рядам. В labels нет request_id, command_id и profile_id.
+
+### A/B: `pandaproxy_client.produce_batch_delay_ms` (A = 100 мс, B = 5 мс)
+
+Baseline `20261109T202942Z-steady` (20 POST/с, 3 worker, broker):
+- одна HTTP-публикация outbox в среднем занимала 102 мс, запись результата в PG — 3 мс;
+- worker делал 7 lifecycle-публикаций по 108 мс, 758 мс на попытку;
+- на выходе — около 9–10 команд/с и 3,54 ready/с.
+
+Время одной публикации практически равно умолчанию Redpanda `pandaproxy_client.produce_batch_delay_ms = 100 ms`: HTTP Proxy ждёт это время, прежде чем отправить пачку produce брокеру. Эксперимент однофакторный, меняется только эта задержка.
+
+**Параметр.** Это свойство брокера (node property, секция `pandaproxy_client` в `redpanda.yaml`). Брокер читает его только при старте. В bench Compose оно передаётся аргументами `redpanda start`: `--set pandaproxy_client.produce_batch_delay_ms=${BENCH_PANDAPROXY_PRODUCE_BATCH_DELAY_MS:-100}`. По умолчанию 100 — то же, что умолчание Redpanda, поэтому прогоны без переменной не меняются. Корневой `docker-compose.yml` не тронут.
+
+**Что остаётся неизменным:**
+- 20 POST/с, 3 worker, broker, 3 партиции;
+- acks и retries HTTP Proxy (умолчания), retries worker и outbox;
+- 7 lifecycle-событий на попытку;
+- последовательная публикация outbox пачками по `OUTBOX_BATCH_SIZE=50`;
+- Go-код обработки событий.
+
+**Перезапуск брокера.** В обычном режиме (`BENCH_REUSE` не задан) `docker compose up` видит изменённую команду и пересоздаёт контейнер `redpanda`. Workers переподключают consumers сами. `BENCH_REUSE=1` брокер не перезапускает и задержку не применяет. Если у работающего брокера значение другое, reuse останавливается до seed и пишет причину в `reuse-check/`.
+
+**Запрошенное и подтверждённое значение.** В `host/redpanda-config.json` и `environment.json` → `host.redpanda_config`, а также в `run.env` пишутся:
+- `requested_ms` и `requested_source` (`explicit` или `default`);
+- `confirmed_ms_from_broker_log` — значение, которое процесс брокера вывел в лог при последнем старте (строка `pandaproxy_client.produce_batch_delay_ms:<N>ms`);
+- `value_ms_in_redpanda_yaml` — что записал `--set`;
+- `status`: `confirmed`, `mismatch`, `file_only` или `unconfirmed`.
+
+При явно заданном значении в `summary.md` есть проверка «применён брокером»: она пройдена только при `status=confirmed`. Проверить вручную:
+
+```bash
+DC="docker compose -p avito-recap-bench -f bench/compose.bench.yml"
+$DC config | grep -n 'produce_batch_delay_ms'                       # что уйдёт в команду
+docker logs --since "$(docker inspect -f '{{.State.StartedAt}}' "$($DC ps -q redpanda)")" \
+  "$($DC ps -q redpanda)" 2>&1 | grep -o 'pandaproxy_client.produce_batch_delay_ms:[0-9]*ms'   # применено процессом
+$DC exec -T redpanda grep -n -A0 'produce_batch_delay_ms' /etc/redpanda/redpanda.yaml        # записано в конфиг
+```
+
+Если лог брокера этой строки не содержит, статус будет `file_only` или `unconfirmed`, и проверка в отчёте не пройдёт. В этом случае пришлите вывод команд выше — формат лога v26.2.2 на стенде не проверялся.
+
+**Ворота перед фазами.** В steady перед прогревом и перед измерением выполняется `phase_gate`, ожидание до `BENCH_PHASE_GATE_WAIT_S=600`:
+- в PG нет `queued`/`processing` и нет неопубликованных записей outbox;
+- контейнер `redpanda` в статусе healthy и `rpk cluster health` показывает `Healthy: true`;
+- в VictoriaMetrics свежие targets `api=1, outbox=1, worker=3, sampler=1` и 3 активных consumer;
+- в группе `recap-workers-v1` ровно 3 члена.
+
+При провале фаза k6 не стартует, exit 1, диагностика в `phase-gate-<фаза>/`. Lag Redpanda в ворота не входит: worker коммитит offset последней записи, поэтому у догнавших партиций lag 1.
+
+**Эквивалентные когорты.** Оба прогона стартуют с `BENCH_RESET=1` и одним `SEED`. Volumes пересоздаются, и bench-data генерирует те же профили и события: 1200 на прогрев, 6000 на измерение, 60 на пользовательскую когорту. Прогрев одинаковый — 60 с по 20 POST/с, затем пустые очереди. Минус в том, что `BENCH_RESET` стирает и VictoriaMetrics: графики A после старта B пропадут, а файлы отчёта A в `bench/results` останутся. Если графики нужны, снимите их до B или запускайте B без `BENCH_RESET` с другим `SEED` — когорты будут того же размера, но не идентичными.
+
+```bash
+SEED=20261110
+
+# A: 100 мс (явно, равно умолчанию Redpanda)
+BENCH_RESET=1 SEED=$SEED RUN_ID=$(date -u +%Y%m%dT%H%M%SZ)-steady-A-delay100 \
+  BENCH_PANDAPROXY_PRODUCE_BATCH_DELAY_MS=100 \
+  STEADY_RATE=20 STEADY_WARMUP_S=60 STEADY_DURATION_S=300 STEADY_USER_EVERY_S=5 \
+  WORKERS=3 BENCH_COMMAND_SOURCE=broker make bench-steady
+
+# B: 5 мс, всё остальное то же
+BENCH_RESET=1 SEED=$SEED RUN_ID=$(date -u +%Y%m%dT%H%M%SZ)-steady-B-delay5 \
+  BENCH_PANDAPROXY_PRODUCE_BATCH_DELAY_MS=5 \
+  STEADY_RATE=20 STEADY_WARMUP_S=60 STEADY_DURATION_S=300 STEADY_USER_EVERY_S=5 \
+  WORKERS=3 BENCH_COMMAND_SOURCE=broker make bench-steady
+
+# Сравнение
+for d in bench/results/*-steady-A-delay100 bench/results/*-steady-B-delay5; do
+  echo "== $d"; grep -h '^PRODUCE_BATCH_DELAY_MS\|^SEED\|^STAND_MODE' "$d/run.env"
+  grep -h 'produce_batch_delay_ms\|p95 принятия\|ready со snapshot' "$d/summary.md"
+done
+```
+
+Сравнивайте на панелях 13–17 и в `metrics-end.json` → `window_stats`:
+- среднее HTTP publish в outbox и среднюю lifecycle-публикацию;
+- lifecycle на попытку;
+- опубликованные команды/с, ready/с, backlog и возраст очереди.
+
+Для вывода о влиянии нужно минимум по три прогона на вариант в чередующемся порядке (A, B, B, A, …); один прогон даёт только направление эффекта.
+
+### Устаревшие consumers HTTP Proxy и offset commit (разбор smoke 2026-11-09)
+
+На прогоне `20261109T175410Z-smoke` (SHA `7a31ac6`) 98 из 100 работ стали ready, 2 остались `queued` навсегда, а обработка стояла с 17:55:10 по 17:59:08. Причин две.
+
+1. **Worker не удалял consumer при остановке.** `cmd/worker/main.go` возвращался из `main` сразу по `ctx.Done()`, не дожидаясь горутин, и отложенный `DELETE` экземпляра в HTTP Proxy не успевал выполниться. После пересоздания контейнеров в группе было 6 членов, из них 3 — экземпляры старых контейнеров. Range-назначение отдавало им партиции, которые никто не читал, пока Redpanda не удалил экземпляры по `consumer_instance_timeout_ms` (17:57:15 и 17:59:08). Исправление: `main` ждёт завершения циклов до `WORKER_SHUTDOWN_TIMEOUT` — прерванная попытка возвращается в очередь, consumer удаляется.
+2. **Offset коммитился как «следующий» (`offset+1`), а HTTP Proxy продолжает чтение с `committed+1`.** В логе Redpanda видно `fetch offset_out_of_range ... requested: 79 ... high watermark: 78` при `CURRENT-OFFSET 78`. На догнавшей партиции это давало сброс на earliest и полное перечитывание (его поглощает inbox `consumed_events`). На партиции с непрочитанными записями при смене владельца одна запись пропускалась. В broker-режиме пропущенная команда больше никем не доставляется — это и есть 2 вечных `queued`, по одной на каждую партицию, которая при rebalance ещё содержала непрочитанное. Исправление: коммитится `record.Offset`. Если бы proxy продолжал чтение с committed, последняя запись пришла бы ещё раз, и inbox её отбросит. Пропуск исключён в обоих случаях.
+
+Работы, потерянные в broker-режиме до исправления, сами не восстановятся: их подбирает только опрос PG в режиме `hybrid` или `database`.
 
 ## Что проверить первым запуском
 
@@ -275,6 +423,7 @@ go test ./internal/telemetry ./internal/config ./internal/recap/narrative ./inte
 go test ./...
 go test -race ./internal/worker ./internal/outbox ./internal/broker
 docker compose -p avito-recap-bench -f ../bench/compose.bench.yml config >/dev/null
+node --test ../bench/k6/lib/profiles.test.js
 ```
 
 ---

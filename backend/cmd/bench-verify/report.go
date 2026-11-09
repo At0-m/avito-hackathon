@@ -253,6 +253,24 @@ func (r reportInputs) commonGates() {
 	} else {
 		r.add(categoryMeasurement, "preflight данных", strings.Join(preflight.Problems, "; "), "без замечаний", preflight.Passed)
 	}
+	if requested, ok := r.env["PRODUCE_BATCH_DELAY_MS_REQUESTED"]; ok {
+		// Requested (bench env) vs confirmed (value printed by the running
+		// broker at its last start). A default run only reports the values.
+		value := fmt.Sprintf("requested=%s (%s), broker log=%s, redpanda.yaml=%s, status=%s",
+			requested, r.env["PRODUCE_BATCH_DELAY_MS_SOURCE"], valueOr(r.env["PRODUCE_BATCH_DELAY_MS_CONFIRMED"], "нет"),
+			valueOr(r.env["PRODUCE_BATCH_DELAY_MS_FILE"], "нет"), r.env["PRODUCE_BATCH_DELAY_MS_STATUS"])
+		if r.env["PRODUCE_BATCH_DELAY_MS_SOURCE"] == "explicit" {
+			r.add(categoryConfig, "pandaproxy_client.produce_batch_delay_ms применён брокером", value,
+				"подтверждён логом брокера = "+requested, r.env["PRODUCE_BATCH_DELAY_MS_STATUS"] == "confirmed")
+		} else {
+			r.section("Redpanda HTTP Proxy", "- pandaproxy_client.produce_batch_delay_ms: "+value)
+		}
+	}
+	if members, ok := r.env["GROUP_MEMBERS_START"]; ok {
+		// Stale HTTP Proxy consumers hold partitions until they expire; a run
+		// started with them measures the stale member, not the stand.
+		r.add(categoryMeasurement, "члены consumer group перед нагрузкой", members, r.env["WORKERS"], members == r.env["WORKERS"])
+	}
 	if start, ok := r.metrics("metrics-start.json"); ok {
 		r.add(categoryMeasurement, "scrape targets до нагрузки", describeTargets(start), describeExpected(start), start.Passed)
 	}
@@ -338,7 +356,8 @@ func (r reportInputs) p95Gate(summary k6Summary, metric, label string) {
 
 func (r reportInputs) reconcileSection(title string, value ReconcileResult) {
 	lines := []string{
-		fmt.Sprintf("- POST отправлено: %d (по сценариям: %s); пропуски генератора (исчерпание): %d", value.PostsSent, describeCounts(value.PostsByScenario), value.GeneratorExhausted),
+		fmt.Sprintf("- POST отправлено: %d (по сценариям: %s); нехватка профиля для запланированного POST: %d; итерации сверх квоты: %d",
+			value.PostsSent, describeCounts(value.PostsByScenario), value.GeneratorExhausted, value.IterationsOverQuota),
 		fmt.Sprintf("- Исходы POST: новый 202=%d, повторный 202=%d, готовый 200=%d, failed 202=%d, 4xx=%d, transport/5xx=%d, нарушение контракта=%d",
 			value.New202, value.Repeat202, value.Ready200, value.Failed202, value.Rejected4xx, value.Ambiguous, value.ContractError),
 		fmt.Sprintf("- HTTP статусы: %s", describeCounts(value.HTTPStatuses)),
@@ -386,6 +405,7 @@ func (r reportInputs) k6Section(title string, summary k6Summary) {
 			summary.value("posts_started", "count"), summary.value("posts_accepted_202", "count"),
 			summary.value("posts_ready_200", "count"), summary.value("post_failures", "count"),
 			summary.value("dropped_iterations", "count"), summary.value("profiles_exhausted", "count")),
+		fmt.Sprintf("- Итераций после выполнения квоты (без POST, не ошибка): %.0f", summary.value("iterations_over_quota", "count")),
 		"",
 		"| Метрика k6, мс | n | p50 | p95 | max |",
 		"|---|---:|---:|---:|---:|",
@@ -405,10 +425,12 @@ func (r reportInputs) smoke() {
 	expected := int(r.envFloat("SMOKE_COUNT", 100))
 	if summary, ok := r.summary("smoke"); ok {
 		r.loadGates(summary, int(summary.value("posts_started", "count")), r.envFloat("SMOKE_COUNT", 100)/r.envFloat("SMOKE_RATE", 5), r.envFloat("SMOKE_RATE", 5), "smoke")
+		posts := int(summary.value("posts_started", "count"))
+		r.add(categoryLoad, "smoke: ровно запланированное число POST", strconv.Itoa(posts), strconv.Itoa(expected), posts == expected)
 		r.k6Section("k6 · smoke", summary)
 	}
 	if drain, ok := r.drain("smoke"); ok {
-		r.add(categoryCorrectness, "smoke: drain завершён", fmt.Sprintf("%.1f с после конца подачи", drain.DrainSeconds), "до deadline "+drain.Deadline, drain.Completed)
+		r.add(categoryCorrectness, "smoke: drain завершён", drainValue(drain), "до deadline "+drain.Deadline, drain.Completed)
 	}
 	if value, ok := r.reconcile("smoke"); ok {
 		r.correctnessGates(value, "smoke", expected)
@@ -434,7 +456,7 @@ func (r reportInputs) steady() {
 		r.k6Section("k6 · измерение", summary)
 	}
 	if drain, ok := r.drain("measure"); ok {
-		r.add(categoryCorrectness, "измерение: drain завершён", fmt.Sprintf("%.1f с", drain.DrainSeconds), "до deadline "+drain.Deadline, drain.Completed)
+		r.add(categoryCorrectness, "измерение: drain завершён", drainValue(drain), "до deadline "+drain.Deadline, drain.Completed)
 	}
 	if reconciled {
 		users := value.User.Observed
@@ -582,7 +604,7 @@ func (r reportInputs) burst() {
 		r.reconcileSection("Сверка с PostgreSQL · burst", value)
 	}
 	if drain, ok := r.drain("burst"); ok {
-		r.add(categoryCorrectness, "drain после остановки подачи", fmt.Sprintf("%.1f с", drain.DrainSeconds), "до deadline "+drain.Deadline, drain.Completed)
+		r.add(categoryCorrectness, "drain после остановки подачи", drainValue(drain), "до deadline "+drain.Deadline, drain.Completed)
 		r.section("Drain после остановки нагрузки", fmt.Sprintf("- От конца подачи до готовности всех работ: %.1f с (первая готовность в окне: %.1f с)", drain.DrainSeconds, drain.FirstReadySeconds))
 	}
 	r.verdictLine("burst",
@@ -603,7 +625,7 @@ func (r reportInputs) soak() {
 		r.k6Section("k6 · soak", summary)
 	}
 	if drain, ok := r.drain("soak"); ok {
-		r.add(categoryCorrectness, "drain после остановки подачи", fmt.Sprintf("%.1f с", drain.DrainSeconds), "до deadline "+drain.Deadline, drain.Completed)
+		r.add(categoryCorrectness, "drain после остановки подачи", drainValue(drain), "до deadline "+drain.Deadline, drain.Completed)
 	}
 	if reconciled {
 		r.correctnessGates(value, "soak", int(rate*duration)+value.User.Observed)
@@ -692,7 +714,8 @@ func renderReport(data *reportData) string {
 		fmt.Fprintf(&builder, "- Отсутствуют обязательные файлы: %s\n", strings.Join(data.Missing, ", "))
 	}
 	builder.WriteString("\n## Параметры запуска\n\n")
-	for _, key := range []string{"RUN_ID", "SCENARIO", "TESTID", "SEED", "PROFILES", "EVENTS_PER_PROFILE", "YEAR", "COMMAND_SOURCE", "WORKERS", "NARRATIVE_PROVIDER", "WORKER_RETRY_BASE", "WORKER_RETRY_MAX", "WORKER_MAX_ATTEMPTS", "WORKER_LEASE_DURATION", "WORKER_HEARTBEAT_INTERVAL", "GIT_SHA"} {
+	for _, key := range []string{"RUN_ID", "SCENARIO", "STAND_MODE", "TESTID", "SEED", "PROFILES", "EVENTS_PER_PROFILE", "YEAR", "COMMAND_SOURCE", "WORKERS", "NARRATIVE_PROVIDER", "WORKER_RETRY_BASE", "WORKER_RETRY_MAX", "WORKER_MAX_ATTEMPTS", "WORKER_LEASE_DURATION", "WORKER_HEARTBEAT_INTERVAL",
+		"PRODUCE_BATCH_DELAY_MS_REQUESTED", "PRODUCE_BATCH_DELAY_MS_CONFIRMED", "PRODUCE_BATCH_DELAY_MS_STATUS", "GIT_SHA"} {
 		if value, ok := data.Env[key]; ok {
 			fmt.Fprintf(&builder, "- %s: `%s`\n", key, value)
 		}
@@ -733,6 +756,22 @@ func renderReport(data *reportData) string {
 	builder.WriteString("- `metrics-*.json` — targets, ряды k6, режим narrative, серверные показатели окна\n")
 	builder.WriteString("- `phases.log` — UTC-границы фаз; `docker-stats.jsonl` — CPU/память контейнеров; `logs/` — логи сервисов\n")
 	return builder.String()
+}
+
+func valueOr(value, fallback string) string {
+	if value == "" {
+		return fallback
+	}
+	return value
+}
+
+// drainValue describes a drain wait; an unfinished drain has no duration.
+func drainValue(drain drainResult) string {
+	if !drain.Completed {
+		return fmt.Sprintf("не завершён за %s: ready=%d, failed=%d, незавершённых=%d, найдено в PG %d из %d",
+			drain.Deadline, drain.Final.Ready, drain.Final.Failed, drain.Final.Pending, drain.Final.FoundInP, drain.Expected)
+	}
+	return fmt.Sprintf("%.1f с от конца подачи (первая готовность %.1f с)", drain.DrainSeconds, drain.FirstReadySeconds)
 }
 
 func escapeCell(value string) string {

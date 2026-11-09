@@ -71,7 +71,7 @@
       "id": 5,
       "type": "timeseries",
       "title": "Consumer lag command topic по партициям (Redpanda)",
-      "description": "max_offset − committed_offset группы recap-workers-v1. «No data» означает недоступность метрики (Redpanda не отдаёт consumer group metrics или target down), а не нулевой lag. В database-режиме lag не показывает незавершённую генерацию.",
+      "description": "max_offset − committed_offset группы recap-workers-v1. «No data» означает недоступность метрики (Redpanda не отдаёт consumer group metrics или target down), а не нулевой lag. В database-режиме lag не показывает незавершённую генерацию. Worker коммитит offset последней обработанной записи (семантика HTTP Proxy), поэтому у догнавшей партиции значение может быть 1.",
       "gridPos": {"h": 9, "w": 12, "x": 0, "y": 18},
       "datasource": {"type": "prometheus", "uid": "bench-vm"},
       "fieldConfig": {"defaults": {"unit": "short", "min": 0}, "overrides": []},
@@ -101,7 +101,7 @@
       "id": 7,
       "type": "timeseries",
       "title": "Этапы worker p95, с: чтение activity из CH, генерация, финализация в PG, попытка целиком",
-      "description": "Generate включает вложенный вызов narrative provider (в bench он отключён). attempt − (activity_read + generate + pg_finalize) ≈ обновления прогресса и публикации lifecycle.",
+      "description": "Generate включает вложенный вызов narrative provider (в bench он отключён). Buckets здесь грубые (…0.25, 0.5, 1, 2.5…). Если все попытки лежат в (0.5, 1], histogram_quantile даёт ровно 0.5 + 0.95·0.5 = 0.975 с, то есть «p95 где-то между 0.5 и 1 с». Точные значения смотрите на панели «попытка целиком (fine)». Не вычитайте p95 этапов друг из друга: время lifecycle внутри попытки показано на отдельной панели.",
       "gridPos": {"h": 9, "w": 12, "x": 0, "y": 27},
       "datasource": {"type": "prometheus", "uid": "bench-vm"},
       "fieldConfig": {"defaults": {"unit": "s", "min": 0}, "overrides": []},
@@ -176,6 +176,82 @@
       "targets": [
         {"refId": "A", "expr": "go_goroutines{job=~\"api|worker|outbox\"}", "legendFormat": "goroutines {{job}} {{instance}}"},
         {"refId": "B", "expr": "rate(process_cpu_seconds_total{job=~\"api|worker|outbox|sampler\"}[30s])", "legendFormat": "CPU cores {{job}} {{instance}}"}
+      ]
+    },
+    {
+      "id": 13,
+      "type": "timeseries",
+      "title": "Outbox: HTTP-публикация команды и запись результата в PG на одно событие — среднее и p95, с",
+      "description": "publish — только HTTP produce в Redpanda (recap_outbox_publish_duration_seconds). record — UPDATE outbox_events после публикации (recap_outbox_record_duration_seconds{result=\"published\"}). Среднее = rate(_sum)/rate(_count) за 1 мин; p95 — histogram_quantile по объединённым buckets. События публикуются последовательно, без параллелизма.",
+      "gridPos": {"h": 9, "w": 12, "x": 0, "y": 54},
+      "datasource": {"type": "prometheus", "uid": "bench-vm"},
+      "fieldConfig": {"defaults": {"unit": "s", "min": 0}, "overrides": []},
+      "options": {"legend": {"displayMode": "table", "placement": "bottom", "calcs": ["mean", "max", "lastNotNull"]}, "tooltip": {"mode": "multi"}},
+      "targets": [
+        {"refId": "A", "expr": "sum(rate(recap_outbox_publish_duration_seconds_sum{job=\"outbox\"}[1m])) / sum(rate(recap_outbox_publish_duration_seconds_count{job=\"outbox\"}[1m]))", "legendFormat": "publish HTTP, среднее"},
+        {"refId": "B", "expr": "histogram_quantile(0.95, sum by (le) (rate(recap_outbox_publish_duration_seconds_bucket{job=\"outbox\"}[1m])))", "legendFormat": "publish HTTP, p95"},
+        {"refId": "C", "expr": "sum(rate(recap_outbox_record_duration_seconds_sum{job=\"outbox\",result=\"published\"}[1m])) / sum(rate(recap_outbox_record_duration_seconds_count{job=\"outbox\",result=\"published\"}[1m]))", "legendFormat": "record PG, среднее"},
+        {"refId": "D", "expr": "histogram_quantile(0.95, sum by (le) (rate(recap_outbox_record_duration_seconds_bucket{job=\"outbox\",result=\"published\"}[1m])))", "legendFormat": "record PG, p95"}
+      ]
+    },
+    {
+      "id": 14,
+      "type": "timeseries",
+      "title": "Outbox: события/с и секунд работы в секунду (publish + record)",
+      "description": "Занятость = (rate(publish _sum) + rate(record _sum)), то есть сумма средних, а не разность квантилей. Значение около 1 на один процесс outbox означает, что последовательный цикл занят почти всё время, и ограничивает скорость публикации.",
+      "gridPos": {"h": 9, "w": 12, "x": 12, "y": 54},
+      "datasource": {"type": "prometheus", "uid": "bench-vm"},
+      "fieldConfig": {"defaults": {"unit": "short", "min": 0}, "overrides": []},
+      "options": {"legend": {"displayMode": "table", "placement": "bottom", "calcs": ["mean", "max"]}, "tooltip": {"mode": "multi"}},
+      "targets": [
+        {"refId": "A", "expr": "sum(rate(recap_outbox_publish_duration_seconds_count{job=\"outbox\"}[1m]))", "legendFormat": "HTTP publish/с"},
+        {"refId": "B", "expr": "sum(rate(recap_outbox_record_duration_seconds_count{job=\"outbox\",result=\"published\"}[1m]))", "legendFormat": "records published/с"},
+        {"refId": "C", "expr": "sum(rate(recap_outbox_publish_duration_seconds_sum{job=\"outbox\"}[1m])) + sum(rate(recap_outbox_record_duration_seconds_sum{job=\"outbox\"}[1m]))", "legendFormat": "занятость, с/с"}
+      ]
+    },
+    {
+      "id": 15,
+      "type": "timeseries",
+      "title": "Worker: lifecycle-публикаций на одну успешную попытку — среднее и p95",
+      "description": "scope=all — starting, 5 progress и ready. scope=attempt_timer — только 5 progress, которые входят в recap_worker_stage_duration_seconds{stage=\"attempt\"}. Учитываются только попытки с result=ready.",
+      "gridPos": {"h": 9, "w": 12, "x": 0, "y": 63},
+      "datasource": {"type": "prometheus", "uid": "bench-vm"},
+      "fieldConfig": {"defaults": {"unit": "short", "min": 0}, "overrides": []},
+      "options": {"legend": {"displayMode": "table", "placement": "bottom", "calcs": ["mean", "max", "lastNotNull"]}, "tooltip": {"mode": "multi"}},
+      "targets": [
+        {"refId": "A", "expr": "sum by (scope) (rate(recap_worker_attempt_lifecycle_calls_sum{job=\"worker\",result=\"ready\"}[1m])) / sum by (scope) (rate(recap_worker_attempt_lifecycle_calls_count{job=\"worker\",result=\"ready\"}[1m]))", "legendFormat": "среднее {{scope}}"},
+        {"refId": "B", "expr": "histogram_quantile(0.95, sum by (scope, le) (rate(recap_worker_attempt_lifecycle_calls_bucket{job=\"worker\",result=\"ready\"}[1m])))", "legendFormat": "p95 {{scope}}"}
+      ]
+    },
+    {
+      "id": 16,
+      "type": "timeseries",
+      "title": "Worker: суммарное время lifecycle на одну успешную попытку и попытка целиком — среднее и p95, с",
+      "description": "lifecycle all/attempt_timer — сумма времени синхронных публикаций в одной попытке (recap_worker_attempt_lifecycle_seconds). attempt — тот же интервал, что stage=attempt, но с мелкими buckets (recap_worker_attempt_duration_seconds). Ряды показаны рядом для сравнения; вычитать p95 одного из p95 другого нельзя.",
+      "gridPos": {"h": 9, "w": 12, "x": 12, "y": 63},
+      "datasource": {"type": "prometheus", "uid": "bench-vm"},
+      "fieldConfig": {"defaults": {"unit": "s", "min": 0}, "overrides": []},
+      "options": {"legend": {"displayMode": "table", "placement": "bottom", "calcs": ["mean", "max", "lastNotNull"]}, "tooltip": {"mode": "multi"}},
+      "targets": [
+        {"refId": "A", "expr": "sum by (scope) (rate(recap_worker_attempt_lifecycle_seconds_sum{job=\"worker\",result=\"ready\"}[1m])) / sum by (scope) (rate(recap_worker_attempt_lifecycle_seconds_count{job=\"worker\",result=\"ready\"}[1m]))", "legendFormat": "lifecycle {{scope}}, среднее"},
+        {"refId": "B", "expr": "histogram_quantile(0.95, sum by (scope, le) (rate(recap_worker_attempt_lifecycle_seconds_bucket{job=\"worker\",result=\"ready\"}[1m])))", "legendFormat": "lifecycle {{scope}}, p95"},
+        {"refId": "C", "expr": "sum(rate(recap_worker_attempt_duration_seconds_sum{job=\"worker\",result=\"ready\"}[1m])) / sum(rate(recap_worker_attempt_duration_seconds_count{job=\"worker\",result=\"ready\"}[1m]))", "legendFormat": "attempt (fine), среднее"},
+        {"refId": "D", "expr": "histogram_quantile(0.95, sum by (le) (rate(recap_worker_attempt_duration_seconds_bucket{job=\"worker\",result=\"ready\"}[1m])))", "legendFormat": "attempt (fine), p95"}
+      ]
+    },
+    {
+      "id": 17,
+      "type": "timeseries",
+      "title": "Worker: одна lifecycle-публикация по фазам — среднее и p95, с",
+      "description": "recap_worker_lifecycle_publish_duration_seconds{phase}: starting и ready — вне таймера попытки, progress — внутри, requeued/failed — после него.",
+      "gridPos": {"h": 9, "w": 24, "x": 0, "y": 72},
+      "datasource": {"type": "prometheus", "uid": "bench-vm"},
+      "fieldConfig": {"defaults": {"unit": "s", "min": 0}, "overrides": []},
+      "options": {"legend": {"displayMode": "table", "placement": "right", "calcs": ["mean", "max"]}, "tooltip": {"mode": "multi"}},
+      "targets": [
+        {"refId": "A", "expr": "sum by (phase) (rate(recap_worker_lifecycle_publish_duration_seconds_sum{job=\"worker\"}[1m])) / sum by (phase) (rate(recap_worker_lifecycle_publish_duration_seconds_count{job=\"worker\"}[1m]))", "legendFormat": "{{phase}}, среднее"},
+        {"refId": "B", "expr": "histogram_quantile(0.95, sum by (phase, le) (rate(recap_worker_lifecycle_publish_duration_seconds_bucket{job=\"worker\"}[1m])))", "legendFormat": "{{phase}}, p95"},
+        {"refId": "C", "expr": "sum by (phase) (rate(recap_worker_lifecycle_publish_duration_seconds_count{job=\"worker\",result=\"error\"}[1m]))", "legendFormat": "{{phase}}, ошибок/с"}
       ]
     }
   ]

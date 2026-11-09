@@ -6,6 +6,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
@@ -101,30 +102,69 @@ func main() {
 	telemetry.StartServer(ctx, cfg.MetricsAddr)
 
 	errCh := make(chan error, 3)
-	go func() { errCh <- runner.RunMaintenance(ctx) }()
+	var loops sync.WaitGroup
+	start := func(loop func() error) {
+		loops.Add(1)
+		go func() {
+			defer loops.Done()
+			errCh <- loop()
+		}()
+	}
+	start(func() error { return runner.RunMaintenance(ctx) })
 
 	switch cfg.WorkerCommandSource {
 	case "broker":
 		log.Printf("worker command source: Redpanda")
-		go func() { errCh <- runBrokerCommands(ctx, proxy, postgresRepository, runner, eventPublisher, cfg, id) }()
+		start(func() error { return runBrokerCommands(ctx, proxy, postgresRepository, runner, eventPublisher, cfg, id) })
 	case "database":
 		log.Printf("worker command source: PostgreSQL queue")
-		go func() { errCh <- runner.Run(ctx) }()
+		start(func() error { return runner.Run(ctx) })
 	case "hybrid":
 		log.Printf("worker command source: Redpanda with PostgreSQL recovery polling")
-		go func() { errCh <- runner.Run(ctx) }()
-		go func() { errCh <- runBrokerCommands(ctx, proxy, postgresRepository, runner, eventPublisher, cfg, id) }()
+		start(func() error { return runner.Run(ctx) })
+		start(func() error { return runBrokerCommands(ctx, proxy, postgresRepository, runner, eventPublisher, cfg, id) })
 	default:
 		log.Fatalf("unsupported WORKER_COMMAND_SOURCE %q: expected broker, database or hybrid", cfg.WorkerCommandSource)
 	}
 
+	var loopErr error
 	select {
 	case <-ctx.Done():
-		return
-	case err := <-errCh:
-		if err != nil {
-			log.Fatal(err)
+	case loopErr = <-errCh:
+		if loopErr != nil {
+			log.Printf("worker loop failed: %v", loopErr)
 		}
+	}
+	// Wait for the loops to finish: an interrupted attempt is requeued and
+	// the Redpanda consumer instance is deleted from the HTTP Proxy. Without
+	// the DELETE the dead instance stays a group member and keeps its
+	// partitions until pandaproxy.consumer_instance_timeout_ms (5 min).
+	stop()
+	if waitTimeout(&loops, cfg.WorkerShutdownTimeout) {
+		log.Printf("worker %s stopped gracefully", id)
+	} else {
+		log.Printf("worker %s shutdown timed out after %s", id, cfg.WorkerShutdownTimeout)
+	}
+	if loopErr != nil {
+		_ = postgres.Close()
+		os.Exit(1)
+	}
+}
+
+// waitTimeout waits for the group and reports whether it finished in time.
+func waitTimeout(group *sync.WaitGroup, timeout time.Duration) bool {
+	done := make(chan struct{})
+	go func() {
+		group.Wait()
+		close(done)
+	}()
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case <-done:
+		return true
+	case <-timer.C:
+		return false
 	}
 }
 

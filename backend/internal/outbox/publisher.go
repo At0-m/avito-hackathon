@@ -80,6 +80,7 @@ func (p *Publisher) publishOne(ctx context.Context, event *model.OutboxEvent) {
 		p.requeue(ctx, event, fmt.Errorf("decode outbox payload: %w", err))
 		return
 	}
+	// Timer 1: the HTTP produce call to Redpanda only (unchanged boundaries).
 	publishStarted := time.Now()
 	err := p.producer.Publish(ctx, event.Topic, event.EventKey, value)
 	telemetry.OutboxPublishDuration.Observe(time.Since(publishStarted).Seconds())
@@ -87,9 +88,17 @@ func (p *Publisher) publishOne(ctx context.Context, event *model.OutboxEvent) {
 		p.requeue(ctx, event, err)
 		return
 	}
-	if err := p.queue.MarkOutboxEventPublished(ctx, event.ID, p.config.PublisherID); err != nil {
+	// Timer 2: the PostgreSQL UPDATE that records the publication result.
+	markStarted := time.Now()
+	markErr := p.queue.MarkOutboxEventPublished(ctx, event.ID, p.config.PublisherID)
+	markResult := telemetry.OutboxRecordPublished
+	if markErr != nil {
+		markResult = telemetry.OutboxRecordError
+	}
+	telemetry.OutboxRecordDuration.Observe(time.Since(markStarted).Seconds(), markResult)
+	if markErr != nil {
 		telemetry.OutboxPublishes.Inc("mark_failed")
-		log.Printf("outbox publisher failed to mark %s published: %v", event.ID, err)
+		log.Printf("outbox publisher failed to mark %s published: %v", event.ID, markErr)
 		return
 	}
 	telemetry.OutboxPublishes.Inc("published")
@@ -104,13 +113,20 @@ func (p *Publisher) requeue(ctx context.Context, event *model.OutboxEvent, cause
 	delay := p.retryDelay(event.AttemptCount)
 	telemetry.OutboxPublishes.Inc("requeued")
 	telemetry.OutboxRetryDelay.Observe(delay.Seconds())
-	if err := p.queue.RequeueOutboxEvent(
+	requeueStarted := time.Now()
+	err := p.queue.RequeueOutboxEvent(
 		ctx,
 		event.ID,
 		p.config.PublisherID,
 		delay,
 		cause.Error(),
-	); err != nil && !errors.Is(err, context.Canceled) {
+	)
+	result := telemetry.OutboxRecordRequeued
+	if err != nil {
+		result = telemetry.OutboxRecordError
+	}
+	telemetry.OutboxRecordDuration.Observe(time.Since(requeueStarted).Seconds(), result)
+	if err != nil && !errors.Is(err, context.Canceled) {
 		log.Printf("outbox publisher failed to requeue %s: %v", event.ID, err)
 	}
 }

@@ -31,6 +31,9 @@ coverage/
 # Docker
 docker-compose.override.yml
 
+# Bench run artifacts (manifests, logs, reports); bench/results/README.md stays tracked
+bench/results/*/
+
 # Temporary files
 *.tmp
 *.temp
