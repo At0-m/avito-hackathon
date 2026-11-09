@@ -163,6 +163,83 @@ verify_topics() {
   exit 1
 }
 
+# ---- BENCH_REUSE=1: run on an already running stand ---------------------------
+
+service_ids() {
+  docker ps -q --filter "label=com.docker.compose.project=$PROJECT" \
+    --filter "label=com.docker.compose.service=$1" --filter status=running
+}
+
+running_count() { service_ids "$1" | grep -c . || true; }
+
+health_of() {
+  local id
+  id=$(service_ids "$1" | head -n 1)
+  if [ -z "$id" ]; then echo absent; return; fi
+  docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}no-healthcheck{{end}}' "$id"
+}
+
+# reuse_fail saves diagnostics of the running stand and stops the scenario
+# before seeding and k6.
+reuse_fail() {
+  local out="$RESULT_DIR/reuse-check"
+  mkdir -p "$out"
+  "${DC[@]}" ps -a >"$out/compose-ps.txt" 2>&1 || true
+  docker ps -a --filter "label=com.docker.compose.project=$PROJECT" \
+    --format '{{.Names}}\t{{.Status}}\t{{.Image}}' >"$out/containers.txt" 2>&1 || true
+  "${DC[@]}" logs --no-color --timestamps --tail 300 \
+    backend outbox worker sampler redpanda victoriametrics >"$out/services-tail.log" 2>&1 || true
+  rpk_exec cluster info >"$out/rpk-cluster-info.txt" 2>&1 || true
+  rpk_exec topic list >"$out/topics.txt" 2>&1 || true
+  describe_group >"$out/group.txt"
+  echo "$(now) reuse check failed: $*" >>"$RESULT_DIR/steps-failed.log"
+  log "FATAL (BENCH_REUSE=1): $*"
+  log "diagnostics: $out; start a fresh stand with BENCH_RESET=1 or make bench-up"
+  exit 1
+}
+
+# reuse_checks replaces stand_up: no build, no recreate, no redpanda-init.
+# Everything the scenario relies on is verified instead.
+reuse_checks() {
+  log "BENCH_REUSE=1: reusing the running stand (no build, no recreate, no redpanda-init)"
+  local problems=() service count health id source
+  for service in postgres clickhouse redpanda backend outbox sampler victoriametrics; do
+    count=$(running_count "$service")
+    [ "$count" -ge 1 ] || problems+=("$service is not running")
+  done
+  for service in postgres clickhouse redpanda backend; do
+    health=$(health_of "$service")
+    [ "$health" = healthy ] || problems+=("$service health=$health")
+  done
+  count=$(running_count worker)
+  [ "$count" = "$WORKERS" ] || problems+=("running workers=$count, expected WORKERS=$WORKERS")
+  # The running workers must use the requested command source, otherwise the
+  # report would label the run with a mode that was not measured.
+  for id in $(service_ids worker); do
+    source=$(docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$id" |
+      awk -F= '$1 == "WORKER_COMMAND_SOURCE" { print $2 }')
+    [ "$source" = "$BENCH_COMMAND_SOURCE" ] ||
+      problems+=("worker $id runs WORKER_COMMAND_SOURCE=$source, requested $BENCH_COMMAND_SOURCE")
+  done
+  if [ "${#problems[@]}" -gt 0 ]; then reuse_fail "${problems[*]}"; fi
+
+  # Kafka API from inside the bench network, with a throw-away rpk container
+  # (redpanda-init is not re-run).
+  local redpanda image network
+  redpanda=$(service_ids redpanda | head -n 1)
+  image=$(docker inspect -f '{{.Config.Image}}' "$redpanda")
+  network=$(docker inspect -f '{{range $name, $value := .NetworkSettings.Networks}}{{$name}} {{end}}' "$redpanda" | awk '{ print $1 }')
+  if ! docker run --rm --network "$network" --entrypoint rpk "$image" \
+    cluster info -X brokers=redpanda:9092 >"$RESULT_DIR/kafka-check.txt" 2>&1; then
+    reuse_fail "Kafka API redpanda:9092 is not reachable from network $network (see kafka-check.txt)"
+  fi
+  # HTTP Proxy used by outbox and workers, from the tools container.
+  if ! tools wget -q -T 10 -O - http://redpanda:8082/brokers >>"$RESULT_DIR/kafka-check.txt" 2>&1; then
+    reuse_fail "Redpanda HTTP Proxy redpanda:8082 is not reachable from the bench network"
+  fi
+  verify_topics "$RESULT_DIR"
+}
+
 stand_down() { "${DC[@]}" --profile tools down --remove-orphans; }
 
 stand_clean() {
@@ -260,19 +337,40 @@ prepare_run() {
   } >"$RESULT_DIR/run.env"
   log "run $RUN_ID: results in $RESULT_DIR"
 
-  if [ "${BENCH_RESET:-0}" = "1" ]; then
-    log "BENCH_RESET=1: removing bench volumes before the run"
-    "${DC[@]}" --profile tools down -v --remove-orphans
+  local reuse=${BENCH_REUSE:-0} mode=fresh
+  if [ "$reuse" = "1" ] && [ "${BENCH_RESET:-0}" = "1" ]; then
+    log "FATAL: BENCH_REUSE=1 and BENCH_RESET=1 are mutually exclusive"
+    exit 2
   fi
-  stand_up
-  verify_topics "$RESULT_DIR"
+  if [ "$reuse" = "1" ]; then
+    mode=reuse
+    reuse_checks
+  else
+    if [ "${BENCH_RESET:-0}" = "1" ]; then
+      mode=reset
+      log "BENCH_RESET=1: removing bench volumes before the run"
+      "${DC[@]}" --profile tools down -v --remove-orphans
+    fi
+    stand_up
+    verify_topics "$RESULT_DIR"
+  fi
+  echo "STAND_MODE=$mode" >>"$RESULT_DIR/run.env"
   mark stand_ready >/dev/null
   start_docker_stats
 
   local consumers=-1
   if [ "$BENCH_COMMAND_SOURCE" != "database" ]; then consumers=$WORKERS; fi
-  step tools bench-verify metrics --expect "api=1,outbox=1,worker=$WORKERS,sampler=1" \
-    --expect-consumers "$consumers" --wait 180s --output "$CONTAINER_DIR/metrics-start.json"
+  if [ "$reuse" = "1" ]; then
+    # Mandatory on a reused stand: every target is up and freshly scraped and
+    # every worker has an active consumer, or the scenario stops before seed.
+    tools bench-verify metrics --expect "api=1,outbox=1,worker=$WORKERS,sampler=1" \
+      --expect-consumers "$consumers" --wait "${BENCH_REUSE_METRICS_WAIT:-60s}" \
+      --output "$CONTAINER_DIR/metrics-start.json" ||
+      reuse_fail "scrape targets or Redpanda consumers do not match (see metrics-start.json)"
+  else
+    step tools bench-verify metrics --expect "api=1,outbox=1,worker=$WORKERS,sampler=1" \
+      --expect-consumers "$consumers" --wait 180s --output "$CONTAINER_DIR/metrics-start.json"
+  fi
   if [ "$BENCH_COMMAND_SOURCE" != "database" ]; then
     wait_group_members start
   fi

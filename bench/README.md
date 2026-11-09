@@ -71,6 +71,37 @@ make bench-clean         # удалить контейнеры, сеть, volume
 
 Exit code: `0` — все проверки пройдены, иначе не ноль. Отчёт сохраняется в любом случае. Повторить прогон на тех же данных можно с прежним `SEED`, но тогда preflight укажет, что когорта уже тёплая. Чистое состояние перед прогоном даёт `BENCH_RESET=1`: стенд пересоздаёт только свои volumes.
 
+### Режимы старта стенда
+
+| Режим | Что делает | `STAND_MODE` в `run.env` |
+|---|---|---|
+| по умолчанию | `docker compose build` + `up -d --wait`: пересоздаёт изменённые контейнеры и запускает `redpanda-init`, затем проверяет топики | `fresh` |
+| `BENCH_RESET=1` | то же, но сначала удаляет volumes проекта `avito-recap-bench`: чистые PG, CH, Redpanda, VM | `reset` |
+| `BENCH_REUSE=1` | работает на уже поднятых контейнерах: без build, без recreate, без повторного `redpanda-init` | `reuse` |
+
+`BENCH_REUSE=1` и `BENCH_RESET=1` взаимоисключающие (exit 2). В режиме reuse до seed и k6 выполняются обязательные проверки, и любой провал завершает сценарий с exit 1:
+
+1. Запущены postgres, clickhouse, redpanda, backend, outbox, sampler и victoriametrics. postgres, clickhouse, redpanda и backend — в статусе `healthy`.
+2. Работает ровно `WORKERS` реплик worker, и у каждой `WORKER_COMMAND_SOURCE` совпадает с `BENCH_COMMAND_SOURCE`.
+3. Kafka API `redpanda:9092` отвечает из bench-сети: отдельный одноразовый контейнер `rpk cluster info`, вывод в `kafka-check.txt`. HTTP Proxy `redpanda:8082/brokers` отвечает из контейнера `tools`.
+4. Есть три топика, по 3 партиции с лидером у каждой (та же проверка, что при обычном старте).
+5. VictoriaMetrics видит свежие targets `api=1, outbox=1, worker=WORKERS, sampler=1` и активные consumers во всех worker (ожидание до `BENCH_REUSE_METRICS_WAIT=60s`).
+
+При провале диагностика сохраняется в `bench/results/<run-id>/reuse-check/`: `compose-ps.txt`, `containers.txt`, `services-tail.log`, `rpk-cluster-info.txt`, `topics.txt`, `group.txt`. Проверка топиков пишет свои файлы в каталог прогона. Типичная причина провала — worker, остановленный прерванным hotkey/backlog: поднимите стенд заново обычным запуском.
+
+Данные прошлых прогонов в режиме reuse остаются. Свежий `SEED` даёт новую холодную когорту, а preflight проверяет, что системная очередь пуста. Ряды в VictoriaMetrics разделяются по `testid`.
+
+Smoke на чистом стенде, затем steady на тех же контейнерах:
+
+```bash
+BENCH_RESET=1 make bench-mvp-smoke     # чистые volumes, build, redpanda-init, проверка топиков
+make bench-status                      # контейнеры работают, worker x3
+BENCH_REUSE=1 make bench-steady        # те же контейнеры: проверки, затем seed и k6
+less "$(ls -td bench/results/*-steady | head -n 1)/summary.md"
+```
+
+Для hotkey и backlog reuse тоже работает: сценарий сам останавливает и запускает workers. Если такой сценарий был прерван, следующий запуск с `BENCH_REUSE=1` остановится на проверке числа workers.
+
 ## Сценарии
 
 ### Smoke — `make bench-mvp-smoke`
@@ -141,7 +172,7 @@ Workers работают весь тест, пары профиль/год но�
 
 ### Общие параметры
 
-`WORKERS=3`, `BENCH_COMMAND_SOURCE=broker` (`database` или `hybrid` для сравнений), `EVENTS_PER_PROFILE=50`, `YEAR=2026`, `SEED`, `RUN_ID`, `TESTID`, `DRAIN_DEADLINE=600s`, `BENCH_RESET=0`, `BENCH_STATS_INTERVAL=5`, `BENCH_GROUP_WAIT_S=360`, `BENCH_PROJECT=avito-recap-bench`.
+`WORKERS=3`, `BENCH_COMMAND_SOURCE=broker` (`database` или `hybrid` для сравнений), `EVENTS_PER_PROFILE=50`, `YEAR=2026`, `SEED`, `RUN_ID`, `TESTID`, `DRAIN_DEADLINE=600s`, `BENCH_RESET=0`, `BENCH_REUSE=0`, `BENCH_REUSE_METRICS_WAIT=60s`, `BENCH_STATS_INTERVAL=5`, `BENCH_GROUP_WAIT_S=360`, `BENCH_PROJECT=avito-recap-bench`.
 
 ## Где лежат результаты
 

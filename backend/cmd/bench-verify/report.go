@@ -701,7 +701,7 @@ func renderReport(data *reportData) string {
 		fmt.Fprintf(&builder, "- Отсутствуют обязательные файлы: %s\n", strings.Join(data.Missing, ", "))
 	}
 	builder.WriteString("\n## Параметры запуска\n\n")
-	for _, key := range []string{"RUN_ID", "SCENARIO", "TESTID", "SEED", "PROFILES", "EVENTS_PER_PROFILE", "YEAR", "COMMAND_SOURCE", "WORKERS", "NARRATIVE_PROVIDER", "WORKER_RETRY_BASE", "WORKER_RETRY_MAX", "WORKER_MAX_ATTEMPTS", "WORKER_LEASE_DURATION", "WORKER_HEARTBEAT_INTERVAL", "GIT_SHA"} {
+	for _, key := range []string{"RUN_ID", "SCENARIO", "STAND_MODE", "TESTID", "SEED", "PROFILES", "EVENTS_PER_PROFILE", "YEAR", "COMMAND_SOURCE", "WORKERS", "NARRATIVE_PROVIDER", "WORKER_RETRY_BASE", "WORKER_RETRY_MAX", "WORKER_MAX_ATTEMPTS", "WORKER_LEASE_DURATION", "WORKER_HEARTBEAT_INTERVAL", "GIT_SHA"} {
 		if value, ok := data.Env[key]; ok {
 			fmt.Fprintf(&builder, "- %s: `%s`\n", key, value)
 		}
