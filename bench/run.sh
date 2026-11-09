@@ -100,7 +100,67 @@ wait_group_members() {
 stand_up() {
   log "building and starting the bench stand (project $PROJECT, workers=$WORKERS, source=$BENCH_COMMAND_SOURCE)"
   "${DC[@]}" build
-  "${DC[@]}" up -d --wait --scale worker="$WORKERS"
+  if ! "${DC[@]}" up -d --wait --scale worker="$WORKERS"; then
+    # Save redpanda-init output and the topic state before failing.
+    verify_topics "$RESULT_DIR"
+    log "FATAL: docker compose up --wait failed (topics are present; see docker compose ps -a)"
+    exit 1
+  fi
+}
+
+REQUIRED_TOPICS=(recap.generation-commands.v1 recap.lifecycle.v1 recap.generation-commands.dlq.v1)
+REQUIRED_PARTITIONS=3
+
+rpk_exec() { "${DC[@]}" exec -T redpanda rpk "$@" -X brokers=redpanda:9092; }
+
+# topic_ready <topic>: partitions 0..N-1 exist and each has a leader.
+# Partition rows of `rpk topic describe -p` start with the partition id,
+# the second column is the leader broker id (-1 when there is none).
+topic_ready() {
+  local described
+  described=$(rpk_exec topic describe "$1" -p 2>&1) || return 1
+  printf '%s\n' "$described" | awk -v want="$REQUIRED_PARTITIONS" '
+    $1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+$/ && $2 >= 0 && $1 < want { seen[$1] = 1 }
+    $1 ~ /^[0-9]+$/ { total++ }
+    END {
+      for (p = 0; p < want; p++) if (!(p in seen)) exit 1
+      exit (total == want ? 0 : 1)
+    }'
+}
+
+# verify_topics [result_dir]: mandatory gate before stand_ready, seeding and
+# k6. redpanda-init exiting 0 is not trusted: with a broken command it used
+# to print the rpk help and exit 0 without creating anything.
+verify_topics() {
+  local dir=${1:-} deadline topic missing
+  deadline=$(($(date +%s) + ${BENCH_TOPIC_WAIT_S:-60}))
+  while true; do
+    missing=()
+    for topic in "${REQUIRED_TOPICS[@]}"; do
+      topic_ready "$topic" || missing+=("$topic")
+    done
+    if [ "${#missing[@]}" -eq 0 ]; then
+      log "topics verified: ${REQUIRED_TOPICS[*]} (${REQUIRED_PARTITIONS} partitions with leaders each)"
+      if [ -n "$dir" ]; then rpk_exec topic list >"$dir/topics.txt" 2>&1 || true; fi
+      return 0
+    fi
+    if [ "$(date +%s)" -ge "$deadline" ]; then break; fi
+    sleep 2
+  done
+
+  local out=${dir:-bench/results/topic-check-$(date -u +%Y%m%dT%H%M%SZ)}
+  mkdir -p "$out"
+  "${DC[@]}" ps -a redpanda-init >"$out/redpanda-init-ps.txt" 2>&1 || true
+  "${DC[@]}" logs --no-color --timestamps redpanda-init >"$out/redpanda-init.log" 2>&1 || true
+  rpk_exec topic list >"$out/topics.txt" 2>&1 || true
+  for topic in "${REQUIRED_TOPICS[@]}"; do
+    echo "== $topic"
+    rpk_exec topic describe "$topic" -p 2>&1 || true
+  done >"$out/topics-describe.txt"
+  echo "$(now) topic check failed: ${missing[*]}" >>"$out/steps-failed.log"
+  log "FATAL: topics missing or without $REQUIRED_PARTITIONS led partitions: ${missing[*]}"
+  log "saved: $out/redpanda-init.log, $out/topics.txt, $out/topics-describe.txt"
+  exit 1
 }
 
 stand_down() { "${DC[@]}" --profile tools down --remove-orphans; }
@@ -205,6 +265,7 @@ prepare_run() {
     "${DC[@]}" --profile tools down -v --remove-orphans
   fi
   stand_up
+  verify_topics "$RESULT_DIR"
   mark stand_ready >/dev/null
   start_docker_stats
 
@@ -472,7 +533,10 @@ usage() {
 
 command=${1:-}
 case "$command" in
-  up) stand_up ;;
+  up)
+    stand_up
+    verify_topics
+    ;;
   down) stand_down ;;
   clean) stand_clean ;;
   status) "${DC[@]}" ps ;;

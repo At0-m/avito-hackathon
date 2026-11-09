@@ -126,10 +126,24 @@ services:
     depends_on:
       redpanda:
         condition: service_healthy
-    entrypoint: ["/bin/sh", "-ec"]
-    command: |
-      rpk topic create --if-not-exists -X brokers=redpanda:9092 --partitions 3 --replicas 1 \
-        recap.generation-commands.v1 recap.lifecycle.v1 recap.generation-commands.dlq.v1
+    # Exec form only. With entrypoint ["/bin/sh", "-ec"] and a string command,
+    # Compose splits the string into argv, sh runs bare "rpk" (the rest become
+    # $0, $1, ...), prints the rpk help and exits 0 without creating topics.
+    # bench/run.sh verifies topics, partitions and leaders independently.
+    entrypoint: ["rpk"]
+    command:
+      - topic
+      - create
+      - recap.generation-commands.v1
+      - recap.lifecycle.v1
+      - recap.generation-commands.dlq.v1
+      - --if-not-exists
+      - --partitions
+      - "3"
+      - --replicas
+      - "1"
+      - -X
+      - brokers=redpanda:9092
     restart: "no"
 
   backend:
