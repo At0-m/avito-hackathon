@@ -138,7 +138,10 @@ func (s *Service) ProcessRecapRequest(
 				progress,
 				request.AttemptCount,
 			)
-			if err := s.lifecyclePublisher.PublishLifecycle(ctx, event); err != nil {
+			// Synchronous; runs inside the worker attempt timer.
+			if err := telemetry.TimeLifecyclePublish(ctx, telemetry.LifecycleProgress, func() error {
+				return s.lifecyclePublisher.PublishLifecycle(ctx, event)
+			}); err != nil {
 				telemetry.EventPublishes.Inc("lifecycle", "error")
 				log.Printf("publish lifecycle progress for %s: %v", request.ID, err)
 			} else {

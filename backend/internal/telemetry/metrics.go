@@ -32,6 +32,10 @@ const (
 	StagePGFinalize   = "pg_finalize"
 	StageAttempt      = "attempt"
 
+	OutboxRecordPublished = "published"
+	OutboxRecordRequeued  = "requeued"
+	OutboxRecordError     = "error"
+
 	NarrativeProviderDisabled    = "provider_disabled"
 	NarrativeProviderSuccess     = "provider_success"
 	NarrativeFallbackProviderErr = "fallback_provider_error"
@@ -136,6 +140,11 @@ var (
 		"recap_outbox_publish_duration_seconds",
 		"Duration of one broker publish call from the outbox publisher.",
 		httpBuckets,
+	)
+	OutboxRecordDuration = Default.HistogramVec(
+		"recap_outbox_record_duration_seconds",
+		"PostgreSQL UPDATE recording the publication result of one outbox event: published (MarkOutboxEventPublished), requeued (RequeueOutboxEvent) or error.",
+		httpBuckets, "result",
 	)
 	OutboxRetryDelay = Default.HistogramVec(
 		"recap_outbox_retry_delay_seconds",

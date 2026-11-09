@@ -274,7 +274,8 @@ Endpoint `/metrics` включается переменной `METRICS_ADDR` (в
 |---|---|
 | API | `recap_http_requests_total`, `recap_http_request_duration_seconds` (route template), `recap_create_outcomes_total{outcome=created/existing_request/snapshot_hit/restarted_failed/error}` |
 | worker | `recap_worker_claims_total{source}`, `recap_worker_queue_wait_seconds`, `recap_worker_attempt_results_total{result}`, `recap_worker_failures_total{code}`, `recap_worker_retry_delay_seconds`, `recap_worker_stage_duration_seconds{stage=activity_read/generate/pg_finalize/attempt}`, `recap_worker_busy`, `recap_worker_expired_lease_failed_total`, `recap_event_publish_total{kind,result}`, `recap_broker_consumer_active`, `recap_broker_consumer_restarts_total`, `recap_narrative_*` |
-| outbox | `recap_outbox_claimed_total`, `recap_outbox_publish_total{result}`, `recap_outbox_publish_duration_seconds`, `recap_outbox_retry_delay_seconds` |
+| outbox | `recap_outbox_claimed_total`, `recap_outbox_publish_total{result}`, `recap_outbox_publish_duration_seconds`, `recap_outbox_record_duration_seconds{result}`, `recap_outbox_retry_delay_seconds` |
+| worker, lifecycle | `recap_worker_lifecycle_publish_duration_seconds{phase,result}`, `recap_worker_attempt_lifecycle_calls{scope,result}`, `recap_worker_attempt_lifecycle_seconds{scope,result}`, `recap_worker_attempt_duration_seconds{result}` |
 | все Go-процессы | `go_goroutines`, `go_gc_heap_live_bytes` (heap после GC), `process_resident_memory_bytes`, `process_cpu_seconds_total`, `process_start_time_seconds`, `go_sql_*` (in use, idle, wait count/duration), `recap_config_value{param}` |
 | sampler (PG, раз в 5 с) | `recap_bench_requests{status}`, `recap_bench_backlog`, `recap_bench_oldest_*_age_seconds`, `recap_bench_delayed_retries`, `recap_bench_expired_leases`, `recap_bench_outbox{status}`, `recap_bench_outbox_oldest_unpublished_age_seconds`, `recap_bench_failed{error_code}`, размеры таблиц, `recap_bench_sampler_up`, `recap_bench_sampler_last_success_timestamp_seconds` |
 | k6 (remote write) | `k6_posts_started_total`, `k6_target_post_rate`, `k6_dropped_iterations_total`, `k6_post_accept_202_p95`, `k6_posts_accepted_202_total`, `k6_posts_ready_200_total`, `k6_post_failures_total`, `k6_user_time_to_ready_p95`, … с тегами `testid`, `scenario`, `phase` (системный тег `url` отключён) |
@@ -282,6 +283,34 @@ Endpoint `/metrics` включается переменной `METRICS_ADDR` (в
 Реплики worker обнаруживаются через Docker DNS (`dns_sd_configs` по имени сервиса). VictoriaMetrics не принимает `refresh_interval` внутри `dns_sd_configs`, поэтому период перерезолва задаётся флагом `-promscrape.dnsSDCheckInterval=5s`. Живым считается target, который отскрейплен не позже 20 с назад (`--max-scrape-age`), и такие targets сравниваются с `WORKERS` до и после нагрузки. Ряды старого контейнера с прежним IP ещё видны в окне lookback, но не считаются и не валят проверку. Их число пишется в `stale_target_series`. При сбое выборки sampler выставляет `recap_bench_sampler_up=0` и не отдаёт устаревшие значения.
 
 Dashboards (`bench/grafana/dashboards`): «Вход и результат» и «Где образовалась очередь». Lag Redpanda считается из `/public_metrics` (`redpanda_kafka_max_offset − redpanda_kafka_consumer_group_committed_offset`). «No data» означает недоступную метрику, а не нулевой lag. Worker коммитит offset последней обработанной записи (семантика HTTP Proxy). Поэтому в `rpk group describe` у догнавшей партиции `CURRENT-OFFSET = LOG-END-OFFSET − 1` и `LAG = 1`; на графике это смещение тоже может быть видно.
+
+### Как читать панели outbox и lifecycle
+
+Панели 13–17 на dashboard «Где образовалась очередь» добавлены после steady `20261109T193855Z-steady`: 20 POST/с, 3 worker, broker. Там около 3,7 ready/с, большая часть принятых работ ещё не опубликована outbox, а p95 попытки стоит на ровных 975 мс.
+
+| Метрика | Таймер стартует | Таймер останавливается | Что не входит |
+|---|---|---|---|
+| `recap_outbox_publish_duration_seconds` (была) | перед `producer.Publish` | после ответа HTTP Proxy | JSON-разбор payload, UPDATE в PG |
+| `recap_outbox_record_duration_seconds{result=published\|requeued\|error}` (новая) | перед `MarkOutboxEventPublished` / `RequeueOutboxEvent` | после UPDATE | HTTP-публикация |
+| `recap_worker_stage_duration_seconds{stage="attempt"}` (была, buckets не менялись) | после lifecycle `starting`, перед запуском heartbeat | после `ProcessRecapRequest` и остановки heartbeat | claim, `starting`, `ready`/`requeued`/`failed`, inbox и commit |
+| `recap_worker_attempt_duration_seconds{result}` (новая) | те же границы, что у `stage="attempt"` | те же | — |
+| `recap_worker_lifecycle_publish_duration_seconds{phase,result}` (новая) | перед `PublishLifecycle` | после ответа HTTP Proxy | — |
+| `recap_worker_attempt_lifecycle_calls` / `_seconds{scope,result}` (новые) | накопление с `starting` | наблюдение один раз после последней публикации попытки (`ready`/`requeued`/`failed`) | — |
+
+Успешная попытка делает 7 синхронных lifecycle-публикаций:
+
+- `starting` — до таймера попытки;
+- 5 × progress внутри таймера: `loading_activity`, `computing_features`, `personalizing`, `generating_narrative`, `persisting_snapshot`. Каждый progress — это ещё и UPDATE `recap_requests` в PG; этот UPDATE отдельно не замеряется;
+- `ready` — после таймера.
+
+`scope=attempt_timer` — это 5 progress-публикаций, `scope=all` — все 7.
+
+- **Панели 13–14 (outbox).** Отдельно показаны среднее и p95 HTTP-публикации и записи результата в PG на одно событие. Ещё одна панель показывает события/с и «занятость» = `rate(publish _sum) + rate(record _sum)` секунд работы в секунду. Outbox публикует события по одному, так что занятость около 1 означает, что последовательный цикл ограничивает скорость публикации.
+- **Панели 15–16 (worker).** Число lifecycle-вызовов и их суммарное время на одну попытку с `result=ready` (среднее и p95), а рядом — попытка целиком на мелких buckets. Это разные распределения: p95 одного нельзя вычитать из p95 другого. Сравнивать можно средние, потому что среднее суммы равно сумме средних.
+- **Панель 17.** Одна публикация по фазам: среднее, p95 и ошибки/с.
+- **Полка 975 мс.** Buckets `stage="attempt"` идут …0.25, 0.5, 1, 2.5…. Если все попытки в окне попадают в (0.5, 1], линейная интерполяция `histogram_quantile` даёт ровно 0.5 + 0.95 · 0.5 = 0.975 при любом реальном распределении внутри корзины. Поэтому 975 мс означает только «p95 между 0,5 и 1 с», точность — ширина корзины, 500 мс. Существующие buckets оставлены для сравнения с исходным прогоном. Точное значение даёт `recap_worker_attempt_duration_seconds` с шагом 0,1 с в этом диапазоне.
+
+Новые метрики не меняют поведение: та же concurrency, тот же размер пачки outbox, те же retries, порядок публикаций, commit и режим worker. Новый прогон с теми же переменными сравним с исходным по прежним рядам. В labels нет request_id, command_id и profile_id.
 
 ### Устаревшие consumers HTTP Proxy и offset commit (разбор smoke 2026-11-09)
 

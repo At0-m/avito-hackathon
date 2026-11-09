@@ -108,6 +108,7 @@ func (r *Runner) ProcessNext(ctx context.Context) (bool, error) {
 		return false, err
 	}
 	r.logClaim(request, telemetry.ClaimSourceDatabase)
+	ctx = telemetry.WithLifecycleAttempt(ctx)
 	r.publishLifecycle(ctx, request, model.RecapRequestProcessing, "starting", 5)
 	_, processErr := r.processClaimed(ctx, request)
 	return true, processErr
@@ -139,6 +140,7 @@ func (r *Runner) ProcessRequestByID(ctx context.Context, requestID string) (bool
 		return false, err
 	}
 	r.logClaim(request, telemetry.ClaimSourceBroker)
+	ctx = telemetry.WithLifecycleAttempt(ctx)
 	r.publishLifecycle(ctx, request, model.RecapRequestProcessing, "starting", 5)
 	return r.processClaimed(ctx, request)
 }
@@ -163,8 +165,12 @@ func (r *Runner) logClaim(request *model.RecapRequest, source string) {
 }
 
 func (r *Runner) processClaimed(parent context.Context, request *model.RecapRequest) (bool, error) {
+	parent = telemetry.EnsureLifecycleAttempt(parent)
 	handled, result, err := r.processClaimedAttempt(parent, request)
 	telemetry.WorkerAttemptResults.Inc(result)
+	// After the last lifecycle publication of the attempt (ready, requeued or
+	// failed); the starting publication is already in the accumulator.
+	telemetry.ObserveLifecycleAttempt(parent, result)
 	return handled, err
 }
 
@@ -190,7 +196,13 @@ func (r *Runner) processClaimedAttempt(parent context.Context, request *model.Re
 	err := r.processor.ProcessRecapRequest(processCtx, request, r.config.WorkerID)
 	close(heartbeatStopped)
 	leaseErr := <-heartbeatResult
-	telemetry.WorkerStageDuration.Observe(time.Since(attemptStarted).Seconds(), telemetry.StageAttempt)
+	// Attempt timer: from after the "starting" lifecycle publication to after
+	// the heartbeat stops. Inside: progress PG updates and the five progress
+	// lifecycle publications, CH read, generation, PG finalize. Outside:
+	// claim, "starting", "ready"/"requeued"/"failed", inbox and commit.
+	attemptSeconds := time.Since(attemptStarted).Seconds()
+	telemetry.WorkerStageDuration.Observe(attemptSeconds, telemetry.StageAttempt)
+	telemetry.WorkerAttemptDuration.Observe(attemptSeconds, attemptOutcome(err, leaseErr))
 	if leaseErr != nil {
 		log.Printf("worker %s lost lease for request %s: %v", r.config.WorkerID, request.ID, leaseErr)
 		if errors.Is(leaseErr, repository.ErrRecapRequestLeaseLost) {
@@ -220,6 +232,7 @@ func (r *Runner) processClaimedAttempt(parent context.Context, request *model.Re
 
 	operationCtx, operationCancel := context.WithTimeout(context.Background(), r.config.ShutdownTimeout)
 	defer operationCancel()
+	operationCtx = telemetry.CarryLifecycleAttempt(parent, operationCtx)
 
 	if retryable && request.AttemptCount < request.MaxAttempts {
 		delay := r.retryDelay(request.AttemptCount)
@@ -278,12 +291,43 @@ func (r *Runner) publishLifecycle(
 		return
 	}
 	event := eventing.NewLifecycle(request.ID, status, stage, progress, request.AttemptCount)
-	if err := r.publisher.PublishLifecycle(ctx, event); err != nil {
+	err := telemetry.TimeLifecyclePublish(ctx, lifecyclePhase(status), func() error {
+		return r.publisher.PublishLifecycle(ctx, event)
+	})
+	if err != nil {
 		telemetry.EventPublishes.Inc("lifecycle", "error")
 		log.Printf("worker %s failed to publish lifecycle event for %s: %v", r.config.WorkerID, request.ID, err)
 		return
 	}
 	telemetry.EventPublishes.Inc("lifecycle", "ok")
+}
+
+// lifecyclePhase maps a runner publication to its metric phase; progress
+// publications come from the service.
+func lifecyclePhase(status model.RecapRequestStatus) string {
+	switch status {
+	case model.RecapRequestReady:
+		return telemetry.LifecycleReady
+	case model.RecapRequestQueued:
+		return telemetry.LifecycleRequeued
+	case model.RecapRequestFailed:
+		return telemetry.LifecycleFailed
+	default:
+		return telemetry.LifecycleStarting
+	}
+}
+
+// attemptOutcome is a coarse label for the fine attempt histogram, known at
+// the moment the attempt timer stops.
+func attemptOutcome(processErr, leaseErr error) string {
+	switch {
+	case leaseErr != nil:
+		return telemetry.AttemptLeaseLost
+	case processErr == nil:
+		return telemetry.AttemptReady
+	default:
+		return "error"
+	}
 }
 
 func (r *Runner) publishDLQ(ctx context.Context, request *model.RecapRequest, code, message string) {
