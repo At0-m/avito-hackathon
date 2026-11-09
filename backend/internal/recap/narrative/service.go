@@ -13,6 +13,7 @@ import (
 	"unicode/utf8"
 
 	recap "recap-personalization/internal/recap"
+	"recap-personalization/internal/telemetry"
 )
 
 var (
@@ -32,23 +33,30 @@ type Service struct {
 func (s Service) Build(ctx context.Context, input Input, topAchievementTitle string) recap.Narrative {
 	fallback := fallbackNarrative(input, topAchievementTitle)
 	if s.Provider == nil {
+		// Template by configuration: no provider call, no timeout, no retry.
+		telemetry.NarrativeOutcomes.Inc(telemetry.NarrativeProviderDisabled)
 		return fallback
 	}
+	telemetry.NarrativeProviderCalls.Inc()
 	result, err := s.Provider.Generate(ctx, input)
 	if err != nil {
 		log.Printf("mistral narrative fallback: provider error: %v", err)
+		telemetry.NarrativeOutcomes.Inc(telemetry.NarrativeFallbackProviderErr)
 		return fallback
 	}
 	parsed, err := parseAndValidate(result.Content, input.SafeFacts, input.Year)
 	if err != nil {
 		log.Printf("mistral narrative fallback: validation error: %v", err)
+		telemetry.NarrativeOutcomes.Inc(telemetry.NarrativeFallbackValidation)
 		return fallback
 	}
 
 	if strings.TrimSpace(result.Model) == "" {
 		log.Printf("mistral narrative fallback: empty model")
+		telemetry.NarrativeOutcomes.Inc(telemetry.NarrativeFallbackValidation)
 		return fallback
 	}
+	telemetry.NarrativeOutcomes.Inc(telemetry.NarrativeProviderSuccess)
 	model := result.Model
 	return recap.Narrative{
 		SummaryTitle:  parsed.SummaryTitle,

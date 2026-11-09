@@ -11,6 +11,7 @@ import (
 	recap "recap-personalization/internal/recap"
 	"recap-personalization/internal/recap/ports"
 	"recap-personalization/internal/repository"
+	"recap-personalization/internal/telemetry"
 
 	"github.com/google/uuid"
 )
@@ -64,7 +65,9 @@ func (s *Service) generateRecapValue(
 		return nil, errors.New("recap_generator_missing")
 	}
 
+	readStarted := time.Now()
 	activities, err := s.clickHouseActivities.GetActivitiesByProfileIDAndYear(ctx, profileID, year)
+	telemetry.WorkerStageDuration.Observe(time.Since(readStarted).Seconds(), telemetry.StageActivityRead)
 	if err != nil {
 		log.Printf("failed to load ClickHouse activities: %v", err)
 		return nil, fmt.Errorf("%w: %v", ErrActivitySourceUnavailable, err)
@@ -87,6 +90,7 @@ func (s *Service) generateRecapValue(
 		}
 	}
 
+	generateStarted := time.Now()
 	output, err := s.recapGenerator.Generate(ctx, recap.GenerateInput{
 		RecapID:     recapID,
 		Profile:     convertProfile(profile),
@@ -94,6 +98,8 @@ func (s *Service) generateRecapValue(
 		Activities:  recapEvents,
 		GeneratedAt: time.Now().UTC(),
 	})
+	// Includes the nested narrative provider call when it is enabled.
+	telemetry.WorkerStageDuration.Observe(time.Since(generateStarted).Seconds(), telemetry.StageGenerate)
 	if err != nil {
 		return nil, err
 	}

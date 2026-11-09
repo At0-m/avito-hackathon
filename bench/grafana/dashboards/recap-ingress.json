@@ -1,0 +1,167 @@
+{
+  "uid": "recap-bench-ingress",
+  "title": "Avito Recap bench · Вход и результат",
+  "description": "Заданные и фактические POST/с, новые работы/с, ready/с, задержки приёма, исходы POST, user time to ready. Фаза нагрузки видна по разбиению k6 по тегу phase.",
+  "tags": ["avito-recap", "bench"],
+  "timezone": "utc",
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": false,
+  "refresh": "5s",
+  "time": {"from": "now-30m", "to": "now"},
+  "templating": {
+    "list": [
+      {
+        "name": "testid",
+        "label": "k6 testid",
+        "type": "query",
+        "datasource": {"type": "prometheus", "uid": "bench-vm"},
+        "query": {"query": "label_values(k6_posts_started_total, testid)", "refId": "testid"},
+        "definition": "label_values(k6_posts_started_total, testid)",
+        "refresh": 2,
+        "includeAll": true,
+        "allValue": ".*",
+        "multi": true,
+        "current": {"selected": true, "text": ["All"], "value": ["$__all"]},
+        "sort": 2
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "timeseries",
+      "title": "Скорости: заданные и начатые POST/с, новые работы/с, ready/с",
+      "description": "target — заданная скорость k6 (сумма сценариев); started — фактически начатые POST; created — решения API created/restarted_failed; ready — прирост recap_requests в статусе ready (sampler, шаг 5 с).",
+      "gridPos": {"h": 9, "w": 16, "x": 0, "y": 0},
+      "datasource": {"type": "prometheus", "uid": "bench-vm"},
+      "fieldConfig": {"defaults": {"unit": "reqps", "min": 0}, "overrides": []},
+      "options": {"legend": {"displayMode": "table", "placement": "bottom", "calcs": ["mean", "max"]}, "tooltip": {"mode": "multi"}},
+      "targets": [
+        {"refId": "A", "expr": "sum(max_over_time(k6_target_post_rate{testid=~\"$testid\"}[10s]))", "legendFormat": "target POST/s (k6)"},
+        {"refId": "B", "expr": "sum(rate(k6_posts_started_total{testid=~\"$testid\"}[30s]))", "legendFormat": "started POST/s (k6)"},
+        {"refId": "C", "expr": "sum(rate(recap_create_outcomes_total{job=\"api\",outcome=~\"created|restarted_failed\"}[30s]))", "legendFormat": "новые работы/с (API)"},
+        {"refId": "D", "expr": "max(rate(recap_bench_requests{status=\"ready\"}[30s]))", "legendFormat": "ready/с (PG)"},
+        {"refId": "E", "expr": "sum(rate(recap_http_requests_total{job=\"api\",route=\"/api/v1/recaps/:id\",method=\"GET\"}[30s]))", "legendFormat": "GET /recaps/:id в секунду"}
+      ]
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "Пропуски генератора",
+      "description": "dropped_iterations — k6 не успел начать итерацию (нет свободного VU). profiles_exhausted — закончились подготовленные пары профиль/год. Ненулевые значения означают «нагрузка не достигнута».",
+      "gridPos": {"h": 9, "w": 8, "x": 16, "y": 0},
+      "datasource": {"type": "prometheus", "uid": "bench-vm"},
+      "fieldConfig": {"defaults": {"unit": "short", "min": 0}, "overrides": []},
+      "options": {"legend": {"displayMode": "list", "placement": "bottom"}, "tooltip": {"mode": "multi"}},
+      "targets": [
+        {"refId": "A", "expr": "sum by (scenario) (increase(k6_dropped_iterations_total{testid=~\"$testid\"}[30s]))", "legendFormat": "dropped {{scenario}}"},
+        {"refId": "B", "expr": "sum(increase(k6_profiles_exhausted_total{testid=~\"$testid\"}[30s]))", "legendFormat": "profiles exhausted"}
+      ]
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "Приём POST на клиенте (cold 202), мс",
+      "description": "От начала POST до получения и проверки тела. Квантили k6 Trend за интервал отправки remote write (5 с); итоговый p95 прогона — в k6 summary.",
+      "gridPos": {"h": 9, "w": 12, "x": 0, "y": 9},
+      "datasource": {"type": "prometheus", "uid": "bench-vm"},
+      "fieldConfig": {"defaults": {"unit": "ms", "min": 0}, "overrides": []},
+      "options": {"legend": {"displayMode": "table", "placement": "bottom", "calcs": ["mean", "max"]}, "tooltip": {"mode": "multi"}},
+      "targets": [
+        {"refId": "A", "expr": "max(k6_post_accept_202_p50{testid=~\"$testid\"})", "legendFormat": "p50"},
+        {"refId": "B", "expr": "max(k6_post_accept_202_p95{testid=~\"$testid\"})", "legendFormat": "p95"},
+        {"refId": "C", "expr": "max(k6_post_accept_202_p99{testid=~\"$testid\"})", "legendFormat": "p99"},
+        {"refId": "D", "expr": "max(k6_post_accept_200_p95{testid=~\"$testid\"})", "legendFormat": "p95 готовый 200"}
+      ]
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "Приём POST на сервере, с (histogram API)",
+      "description": "recap_http_request_duration_seconds по шаблону маршрута, buckets объединены по репликам до quantile.",
+      "gridPos": {"h": 9, "w": 12, "x": 12, "y": 9},
+      "datasource": {"type": "prometheus", "uid": "bench-vm"},
+      "fieldConfig": {"defaults": {"unit": "s", "min": 0}, "overrides": []},
+      "options": {"legend": {"displayMode": "list", "placement": "bottom"}, "tooltip": {"mode": "multi"}},
+      "targets": [
+        {"refId": "A", "expr": "histogram_quantile(0.5, sum by (le) (rate(recap_http_request_duration_seconds_bucket{job=\"api\",route=\"/api/v1/recaps\",method=\"POST\"}[30s])))", "legendFormat": "POST p50"},
+        {"refId": "B", "expr": "histogram_quantile(0.95, sum by (le) (rate(recap_http_request_duration_seconds_bucket{job=\"api\",route=\"/api/v1/recaps\",method=\"POST\"}[30s])))", "legendFormat": "POST p95"},
+        {"refId": "C", "expr": "histogram_quantile(0.99, sum by (le) (rate(recap_http_request_duration_seconds_bucket{job=\"api\",route=\"/api/v1/recaps\",method=\"POST\"}[30s])))", "legendFormat": "POST p99"},
+        {"refId": "D", "expr": "histogram_quantile(0.95, sum by (le) (rate(recap_http_request_duration_seconds_bucket{job=\"api\",route=\"/api/v1/recaps/:id\",method=\"GET\"}[30s])))", "legendFormat": "GET :id p95"}
+      ]
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "Исходы POST: решение API и класс ответа клиента",
+      "description": "API: created — новая работа (202), existing_request — повторный 202, snapshot_hit — готовый 200, restarted_failed — перезапуск failed. Клиент: 202/200/ошибки по k6.",
+      "gridPos": {"h": 9, "w": 12, "x": 0, "y": 18},
+      "datasource": {"type": "prometheus", "uid": "bench-vm"},
+      "fieldConfig": {"defaults": {"unit": "reqps", "min": 0}, "overrides": []},
+      "options": {"legend": {"displayMode": "table", "placement": "bottom", "calcs": ["mean", "max"]}, "tooltip": {"mode": "multi"}},
+      "targets": [
+        {"refId": "A", "expr": "sum by (outcome) (rate(recap_create_outcomes_total{job=\"api\"}[30s]))", "legendFormat": "API {{outcome}}"},
+        {"refId": "B", "expr": "sum(rate(k6_posts_accepted_202_total{testid=~\"$testid\"}[30s]))", "legendFormat": "k6 202"},
+        {"refId": "C", "expr": "sum(rate(k6_posts_ready_200_total{testid=~\"$testid\"}[30s]))", "legendFormat": "k6 200"},
+        {"refId": "D", "expr": "sum(rate(k6_post_failures_total{testid=~\"$testid\"}[30s]))", "legendFormat": "k6 ошибки POST"}
+      ]
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "HTTP по маршрутам и классам статуса (API)",
+      "gridPos": {"h": 9, "w": 12, "x": 12, "y": 18},
+      "datasource": {"type": "prometheus", "uid": "bench-vm"},
+      "fieldConfig": {"defaults": {"unit": "reqps", "min": 0}, "overrides": []},
+      "options": {"legend": {"displayMode": "list", "placement": "bottom"}, "tooltip": {"mode": "multi"}},
+      "targets": [
+        {"refId": "A", "expr": "sum by (method, route, status_class) (rate(recap_http_requests_total{job=\"api\"}[30s]))", "legendFormat": "{{method}} {{route}} {{status_class}}"}
+      ]
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "Подача по фазам (k6 tag phase)",
+      "description": "Начатые POST/с, разбитые по фазе нагрузки: smoke, warmup, measure, pre/spike/post (burst), hotkey, backlog-fill.",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 27},
+      "datasource": {"type": "prometheus", "uid": "bench-vm"},
+      "fieldConfig": {"defaults": {"unit": "reqps", "min": 0, "custom": {"stacking": {"mode": "normal"}, "fillOpacity": 30}}, "overrides": []},
+      "options": {"legend": {"displayMode": "list", "placement": "bottom"}, "tooltip": {"mode": "multi"}},
+      "targets": [
+        {"refId": "A", "expr": "sum by (phase) (rate(k6_posts_started_total{testid=~\"$testid\"}[30s]))", "legendFormat": "{{phase}}"}
+      ]
+    },
+    {
+      "id": 8,
+      "type": "timeseries",
+      "title": "User time to ready (polling с poll_after_ms), мс",
+      "description": "Отдельная небольшая когорта; см. user_ready/user_timeout. Число наблюдений — в k6 summary и reconcile.",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 27},
+      "datasource": {"type": "prometheus", "uid": "bench-vm"},
+      "fieldConfig": {"defaults": {"unit": "ms", "min": 0}, "overrides": []},
+      "options": {"legend": {"displayMode": "list", "placement": "bottom"}, "tooltip": {"mode": "multi"}},
+      "targets": [
+        {"refId": "A", "expr": "max(k6_user_time_to_ready_p50{testid=~\"$testid\"})", "legendFormat": "p50"},
+        {"refId": "B", "expr": "max(k6_user_time_to_ready_p95{testid=~\"$testid\"})", "legendFormat": "p95"},
+        {"refId": "C", "expr": "sum(increase(k6_user_ready_total{testid=~\"$testid\"}[30s]))", "legendFormat": "ready за 30 с"},
+        {"refId": "D", "expr": "sum(increase(k6_user_timeout_total{testid=~\"$testid\"}[30s]))", "legendFormat": "timeout за 30 с"}
+      ]
+    },
+    {
+      "id": 9,
+      "type": "timeseries",
+      "title": "Failed по стабильному коду и источник narrative",
+      "description": "recap_bench_failed — накопленные failed по error_code (PG). Narrative: provider_disabled — штатный template при отключённом provider; fallback_* — template после ошибки включённого provider.",
+      "gridPos": {"h": 8, "w": 24, "x": 0, "y": 35},
+      "datasource": {"type": "prometheus", "uid": "bench-vm"},
+      "fieldConfig": {"defaults": {"unit": "short", "min": 0}, "overrides": []},
+      "options": {"legend": {"displayMode": "list", "placement": "bottom"}, "tooltip": {"mode": "multi"}},
+      "targets": [
+        {"refId": "A", "expr": "max by (error_code) (recap_bench_failed)", "legendFormat": "failed {{error_code}}"},
+        {"refId": "B", "expr": "sum by (outcome) (rate(recap_narrative_outcomes_total{job=\"worker\"}[1m]))", "legendFormat": "narrative {{outcome}}/с"},
+        {"refId": "C", "expr": "sum(rate(recap_narrative_provider_calls_total{job=\"worker\"}[1m]))", "legendFormat": "вызовы provider/с"}
+      ]
+    }
+  ]
+}

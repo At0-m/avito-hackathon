@@ -10,6 +10,7 @@ import (
 
 	"github.com/google/uuid"
 	"recap-personalization/internal/model"
+	"recap-personalization/internal/telemetry"
 )
 
 type Queue interface {
@@ -66,6 +67,7 @@ func (p *Publisher) Run(ctx context.Context) error {
 			}
 			continue
 		}
+		telemetry.OutboxClaimed.Add(float64(len(events)))
 		for index := range events {
 			p.publishOne(ctx, &events[index])
 		}
@@ -78,17 +80,30 @@ func (p *Publisher) publishOne(ctx context.Context, event *model.OutboxEvent) {
 		p.requeue(ctx, event, fmt.Errorf("decode outbox payload: %w", err))
 		return
 	}
-	if err := p.producer.Publish(ctx, event.Topic, event.EventKey, value); err != nil {
+	publishStarted := time.Now()
+	err := p.producer.Publish(ctx, event.Topic, event.EventKey, value)
+	telemetry.OutboxPublishDuration.Observe(time.Since(publishStarted).Seconds())
+	if err != nil {
 		p.requeue(ctx, event, err)
 		return
 	}
 	if err := p.queue.MarkOutboxEventPublished(ctx, event.ID, p.config.PublisherID); err != nil {
+		telemetry.OutboxPublishes.Inc("mark_failed")
 		log.Printf("outbox publisher failed to mark %s published: %v", event.ID, err)
+		return
 	}
+	telemetry.OutboxPublishes.Inc("published")
+}
+
+// EffectiveConfig returns the configuration after defaults and normalization.
+func (p *Publisher) EffectiveConfig() Config {
+	return p.config
 }
 
 func (p *Publisher) requeue(ctx context.Context, event *model.OutboxEvent, cause error) {
 	delay := p.retryDelay(event.AttemptCount)
+	telemetry.OutboxPublishes.Inc("requeued")
+	telemetry.OutboxRetryDelay.Observe(delay.Seconds())
 	if err := p.queue.RequeueOutboxEvent(
 		ctx,
 		event.ID,

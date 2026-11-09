@@ -1,0 +1,182 @@
+{
+  "uid": "recap-bench-queue",
+  "title": "Avito Recap bench · Где образовалась очередь",
+  "description": "Очередь PostgreSQL, outbox, lag Redpanda, claims, попытки и retry, этапы обработки worker, PG pool, runtime и живые scrape targets.",
+  "tags": ["avito-recap", "bench"],
+  "timezone": "utc",
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": false,
+  "refresh": "5s",
+  "time": {"from": "now-30m", "to": "now"},
+  "panels": [
+    {
+      "id": 1,
+      "type": "timeseries",
+      "title": "Очередь recap_requests: queued / processing",
+      "description": "Sampler PostgreSQL раз в 5 с. delayed — queued с available_at в будущем (ожидание backoff). expired leases — processing с истёкшей lease (ждут reclaim). Пропуски значений — sampler_up=0.",
+      "gridPos": {"h": 9, "w": 12, "x": 0, "y": 0},
+      "datasource": {"type": "prometheus", "uid": "bench-vm"},
+      "fieldConfig": {"defaults": {"unit": "short", "min": 0}, "overrides": []},
+      "options": {"legend": {"displayMode": "table", "placement": "bottom", "calcs": ["max", "lastNotNull"]}, "tooltip": {"mode": "multi"}},
+      "targets": [
+        {"refId": "A", "expr": "max by (status) (recap_bench_requests{status=~\"queued|processing\"})", "legendFormat": "{{status}}"},
+        {"refId": "B", "expr": "max(recap_bench_delayed_retries)", "legendFormat": "delayed retries"},
+        {"refId": "C", "expr": "max(recap_bench_expired_leases)", "legendFormat": "expired leases"},
+        {"refId": "D", "expr": "max(recap_bench_sampler_up)", "legendFormat": "sampler_up"}
+      ]
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "Возраст старейшей ожидающей работы и неопубликованной записи outbox",
+      "gridPos": {"h": 9, "w": 12, "x": 12, "y": 0},
+      "datasource": {"type": "prometheus", "uid": "bench-vm"},
+      "fieldConfig": {"defaults": {"unit": "s", "min": 0}, "overrides": []},
+      "options": {"legend": {"displayMode": "table", "placement": "bottom", "calcs": ["max", "lastNotNull"]}, "tooltip": {"mode": "multi"}},
+      "targets": [
+        {"refId": "A", "expr": "max(recap_bench_oldest_queued_age_seconds)", "legendFormat": "старейшая queued"},
+        {"refId": "B", "expr": "max(recap_bench_oldest_backlog_age_seconds)", "legendFormat": "старейшая queued+processing"},
+        {"refId": "C", "expr": "max(recap_bench_outbox_oldest_unpublished_age_seconds)", "legendFormat": "старейшая неопубликованная outbox"}
+      ]
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "Outbox: pending / publishing и публикации",
+      "gridPos": {"h": 9, "w": 12, "x": 0, "y": 9},
+      "datasource": {"type": "prometheus", "uid": "bench-vm"},
+      "fieldConfig": {"defaults": {"unit": "short", "min": 0}, "overrides": []},
+      "options": {"legend": {"displayMode": "list", "placement": "bottom"}, "tooltip": {"mode": "multi"}},
+      "targets": [
+        {"refId": "A", "expr": "max by (status) (recap_bench_outbox{status=~\"pending|publishing\"})", "legendFormat": "{{status}}"},
+        {"refId": "B", "expr": "sum by (result) (rate(recap_outbox_publish_total{job=\"outbox\"}[30s]))", "legendFormat": "publish {{result}}/с"},
+        {"refId": "C", "expr": "sum by (kind, result) (rate(recap_event_publish_total{job=\"worker\"}[30s]))", "legendFormat": "worker {{kind}} {{result}}/с"}
+      ]
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "Outbox publish latency и backoff, с",
+      "gridPos": {"h": 9, "w": 12, "x": 12, "y": 9},
+      "datasource": {"type": "prometheus", "uid": "bench-vm"},
+      "fieldConfig": {"defaults": {"unit": "s", "min": 0}, "overrides": []},
+      "options": {"legend": {"displayMode": "list", "placement": "bottom"}, "tooltip": {"mode": "multi"}},
+      "targets": [
+        {"refId": "A", "expr": "histogram_quantile(0.95, sum by (le) (rate(recap_outbox_publish_duration_seconds_bucket{job=\"outbox\"}[30s])))", "legendFormat": "publish p95"},
+        {"refId": "B", "expr": "histogram_quantile(0.95, sum by (le) (rate(recap_outbox_retry_delay_seconds_bucket{job=\"outbox\"}[1m])))", "legendFormat": "outbox retry delay p95"}
+      ]
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "Consumer lag command topic по партициям (Redpanda)",
+      "description": "max_offset − committed_offset группы recap-workers-v1. «No data» означает недоступность метрики (Redpanda не отдаёт consumer group metrics или target down), а не нулевой lag. В database-режиме lag не показывает незавершённую генерацию.",
+      "gridPos": {"h": 9, "w": 12, "x": 0, "y": 18},
+      "datasource": {"type": "prometheus", "uid": "bench-vm"},
+      "fieldConfig": {"defaults": {"unit": "short", "min": 0}, "overrides": []},
+      "options": {"legend": {"displayMode": "list", "placement": "bottom"}, "tooltip": {"mode": "multi"}},
+      "targets": [
+        {"refId": "A", "expr": "max by (redpanda_partition) (redpanda_kafka_max_offset{redpanda_topic=\"recap.generation-commands.v1\"}) - on (redpanda_partition) max by (redpanda_partition) (redpanda_kafka_consumer_group_committed_offset{redpanda_group=\"recap-workers-v1\",redpanda_topic=\"recap.generation-commands.v1\"})", "legendFormat": "partition {{redpanda_partition}}"},
+        {"refId": "B", "expr": "max(up{job=\"redpanda\"})", "legendFormat": "redpanda target up"}
+      ]
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "Claims по источнику и результаты попыток",
+      "description": "source=broker — команда из Redpanda, database — опрос PostgreSQL (database/hybrid). requeued — повтор с backoff; failed_exhausted — исчерпан retry budget; lease_lost — финализация после потери lease.",
+      "gridPos": {"h": 9, "w": 12, "x": 12, "y": 18},
+      "datasource": {"type": "prometheus", "uid": "bench-vm"},
+      "fieldConfig": {"defaults": {"unit": "ops", "min": 0}, "overrides": []},
+      "options": {"legend": {"displayMode": "table", "placement": "bottom", "calcs": ["mean", "max"]}, "tooltip": {"mode": "multi"}},
+      "targets": [
+        {"refId": "A", "expr": "sum by (source) (rate(recap_worker_claims_total{job=\"worker\"}[30s]))", "legendFormat": "claim {{source}}"},
+        {"refId": "B", "expr": "sum by (result) (rate(recap_worker_attempt_results_total{job=\"worker\"}[30s]))", "legendFormat": "attempt {{result}}"},
+        {"refId": "C", "expr": "sum(rate(recap_worker_expired_lease_failed_total{job=\"worker\"}[1m]))", "legendFormat": "failed по истёкшей lease"},
+        {"refId": "D", "expr": "sum by (reason) (rate(recap_broker_consumer_restarts_total{job=\"worker\"}[1m]))", "legendFormat": "consumer restart {{reason}}"}
+      ]
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "Этапы worker p95, с: чтение activity из CH, генерация, финализация в PG, попытка целиком",
+      "description": "Generate включает вложенный вызов narrative provider (в bench он отключён). attempt − (activity_read + generate + pg_finalize) ≈ обновления прогресса и публикации lifecycle.",
+      "gridPos": {"h": 9, "w": 12, "x": 0, "y": 27},
+      "datasource": {"type": "prometheus", "uid": "bench-vm"},
+      "fieldConfig": {"defaults": {"unit": "s", "min": 0}, "overrides": []},
+      "options": {"legend": {"displayMode": "table", "placement": "bottom", "calcs": ["mean", "max"]}, "tooltip": {"mode": "multi"}},
+      "targets": [
+        {"refId": "A", "expr": "histogram_quantile(0.95, sum by (stage, le) (rate(recap_worker_stage_duration_seconds_bucket{job=\"worker\"}[1m])))", "legendFormat": "{{stage}} p95"}
+      ]
+    },
+    {
+      "id": 8,
+      "type": "timeseries",
+      "title": "Ожидание до claim (available_at → claim) p95 и backoff, с",
+      "gridPos": {"h": 9, "w": 12, "x": 12, "y": 27},
+      "datasource": {"type": "prometheus", "uid": "bench-vm"},
+      "fieldConfig": {"defaults": {"unit": "s", "min": 0}, "overrides": []},
+      "options": {"legend": {"displayMode": "list", "placement": "bottom"}, "tooltip": {"mode": "multi"}},
+      "targets": [
+        {"refId": "A", "expr": "histogram_quantile(0.95, sum by (source, le) (rate(recap_worker_queue_wait_seconds_bucket{job=\"worker\"}[1m])))", "legendFormat": "queue wait p95 {{source}}"},
+        {"refId": "B", "expr": "histogram_quantile(0.95, sum by (le) (rate(recap_worker_retry_delay_seconds_bucket{job=\"worker\"}[5m])))", "legendFormat": "назначенный backoff p95"}
+      ]
+    },
+    {
+      "id": 9,
+      "type": "timeseries",
+      "title": "Загрузка workers и PG pool",
+      "description": "busy — доля workers, обрабатывающих попытку. pool wait — секунды ожидания соединения в секунду (рост = нехватка соединений).",
+      "gridPos": {"h": 9, "w": 12, "x": 0, "y": 36},
+      "datasource": {"type": "prometheus", "uid": "bench-vm"},
+      "fieldConfig": {"defaults": {"unit": "short", "min": 0}, "overrides": []},
+      "options": {"legend": {"displayMode": "list", "placement": "bottom"}, "tooltip": {"mode": "multi"}},
+      "targets": [
+        {"refId": "A", "expr": "sum(recap_worker_busy{job=\"worker\"}) / count(up{job=\"worker\"} == 1)", "legendFormat": "worker busy ratio"},
+        {"refId": "B", "expr": "sum by (job) (go_sql_in_use_connections)", "legendFormat": "pool in use {{job}}"},
+        {"refId": "C", "expr": "sum by (job) (rate(go_sql_wait_duration_seconds_total[30s]))", "legendFormat": "pool wait s/s {{job}}"}
+      ]
+    },
+    {
+      "id": 10,
+      "type": "timeseries",
+      "title": "Живые scrape targets",
+      "description": "Число targets с up=1 по job; для worker должно совпадать с числом реплик. В hotkey/backlog workers намеренно останавливаются.",
+      "gridPos": {"h": 9, "w": 12, "x": 12, "y": 36},
+      "datasource": {"type": "prometheus", "uid": "bench-vm"},
+      "fieldConfig": {"defaults": {"unit": "short", "min": 0, "decimals": 0}, "overrides": []},
+      "options": {"legend": {"displayMode": "list", "placement": "bottom"}, "tooltip": {"mode": "multi"}},
+      "targets": [
+        {"refId": "A", "expr": "sum by (job) (up == 1)", "legendFormat": "{{job}}"},
+        {"refId": "B", "expr": "sum(recap_broker_consumer_active{job=\"worker\"})", "legendFormat": "активные consumers"}
+      ]
+    },
+    {
+      "id": 11,
+      "type": "timeseries",
+      "title": "RSS и heap после GC по процессам",
+      "gridPos": {"h": 9, "w": 12, "x": 0, "y": 45},
+      "datasource": {"type": "prometheus", "uid": "bench-vm"},
+      "fieldConfig": {"defaults": {"unit": "bytes", "min": 0}, "overrides": []},
+      "options": {"legend": {"displayMode": "list", "placement": "bottom"}, "tooltip": {"mode": "multi"}},
+      "targets": [
+        {"refId": "A", "expr": "process_resident_memory_bytes{job=~\"api|worker|outbox|sampler\"}", "legendFormat": "RSS {{job}} {{instance}}"},
+        {"refId": "B", "expr": "go_gc_heap_live_bytes{job=~\"api|worker|outbox\"}", "legendFormat": "heap live {{job}} {{instance}}"}
+      ]
+    },
+    {
+      "id": 12,
+      "type": "timeseries",
+      "title": "Goroutines и CPU по процессам",
+      "gridPos": {"h": 9, "w": 12, "x": 12, "y": 45},
+      "datasource": {"type": "prometheus", "uid": "bench-vm"},
+      "fieldConfig": {"defaults": {"unit": "short", "min": 0}, "overrides": []},
+      "options": {"legend": {"displayMode": "list", "placement": "bottom"}, "tooltip": {"mode": "multi"}},
+      "targets": [
+        {"refId": "A", "expr": "go_goroutines{job=~\"api|worker|outbox\"}", "legendFormat": "goroutines {{job}} {{instance}}"},
+        {"refId": "B", "expr": "rate(process_cpu_seconds_total{job=~\"api|worker|outbox|sampler\"}[30s])", "legendFormat": "CPU cores {{job}} {{instance}}"}
+      ]
+    }
+  ]
+}

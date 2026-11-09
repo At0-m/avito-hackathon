@@ -1,0 +1,13 @@
+apiVersion: 1
+
+datasources:
+  - name: VictoriaMetrics
+    uid: bench-vm
+    type: prometheus
+    access: proxy
+    url: http://victoriametrics:8428
+    isDefault: true
+    editable: false
+    jsonData:
+      timeInterval: 5s
+      httpMethod: POST

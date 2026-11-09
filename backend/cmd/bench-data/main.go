@@ -11,6 +11,7 @@ import (
 	"math/rand"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -51,6 +52,7 @@ func main() {
 	batchSize := flag.Int("batch-size", 10000, "ClickHouse rows per insert")
 	postgresURL := flag.String("postgres-url", env("DATABASE_URL", "postgres://avito:avito_password@localhost:5432/avito_recap?sslmode=disable"), "PostgreSQL connection URL")
 	clickhouseURL := flag.String("clickhouse-url", env("CLICKHOUSE_URL", "http://localhost:8123"), "ClickHouse HTTP endpoint")
+	idsOutput := flag.String("ids-output", "", "optional JSON file with profile IDs in index order (used by k6 and bench-verify)")
 	flag.Parse()
 
 	if *profiles <= 0 || *eventsPerProfile <= 0 || *batchSize <= 0 {
@@ -131,7 +133,30 @@ func main() {
 		}
 	}
 	flush()
+	if *idsOutput != "" {
+		if err := writeProfileIDs(*idsOutput, ids); err != nil {
+			log.Fatal(err)
+		}
+		log.Printf("profile IDs written to %s", *idsOutput)
+	}
 	log.Printf("benchmark dataset ready: profiles=%d events=%d year=%d seed=%d", *profiles, total, *year, *seed)
+}
+
+func writeProfileIDs(path string, ids []uuid.UUID) error {
+	values := make([]string, len(ids))
+	for index, id := range ids {
+		values[index] = id.String()
+	}
+	encoded, err := json.Marshal(values)
+	if err != nil {
+		return err
+	}
+	if dir := filepath.Dir(path); dir != "" {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return err
+		}
+	}
+	return os.WriteFile(path, encoded, 0o644)
 }
 
 func benchmarkProfileID(seed int64, index int) uuid.UUID {
