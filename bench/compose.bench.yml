@@ -112,6 +112,11 @@ services:
       - --smp
       - "1"
       - --default-log-level=info
+      # HTTP Proxy produce batching delay (broker/node property, read only at
+      # broker start). Default 100 equals the Redpanda default, so runs that
+      # do not set it are unchanged. A/B: 100 (A) vs 5 (B), see bench/README.md.
+      - --set
+      - pandaproxy_client.produce_batch_delay_ms=${BENCH_PANDAPROXY_PRODUCE_BATCH_DELAY_MS:-100}
     volumes:
       - redpanda_data:/var/lib/redpanda/data
     healthcheck:

@@ -24,6 +24,19 @@ export BENCH_WORKER_RETRY_MAX=${BENCH_WORKER_RETRY_MAX:-1s}
 export BENCH_WORKER_MAX_ATTEMPTS=${BENCH_WORKER_MAX_ATTEMPTS:-3}
 export BENCH_WORKER_LEASE_DURATION=${BENCH_WORKER_LEASE_DURATION:-30s}
 export BENCH_WORKER_HEARTBEAT_INTERVAL=${BENCH_WORKER_HEARTBEAT_INTERVAL:-10s}
+# Redpanda HTTP Proxy produce batching delay (pandaproxy_client.
+# produce_batch_delay_ms). Applied only when the broker (re)starts; the
+# default equals the Redpanda default of 100 ms.
+if [ -n "${BENCH_PANDAPROXY_PRODUCE_BATCH_DELAY_MS:-}" ]; then
+  PRODUCE_DELAY_SOURCE=explicit
+else
+  PRODUCE_DELAY_SOURCE=default
+fi
+export BENCH_PANDAPROXY_PRODUCE_BATCH_DELAY_MS=${BENCH_PANDAPROXY_PRODUCE_BATCH_DELAY_MS:-100}
+if ! [[ "$BENCH_PANDAPROXY_PRODUCE_BATCH_DELAY_MS" =~ ^[0-9]+$ ]]; then
+  echo "BENCH_PANDAPROXY_PRODUCE_BATCH_DELAY_MS must be a non-negative integer (milliseconds)" >&2
+  exit 2
+fi
 WORKERS=${WORKERS:-3}
 YEAR=${YEAR:-2026}
 EVENTS_PER_PROFILE=${EVENTS_PER_PROFILE:-50}
@@ -179,6 +192,122 @@ health_of() {
   docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}no-healthcheck{{end}}' "$id"
 }
 
+# stand_fail <subdir> <reason...> saves diagnostics of the running stand and
+# stops the scenario before the next k6 phase.
+stand_fail() {
+  local out="$RESULT_DIR/$1"
+  shift
+  mkdir -p "$out"
+  "${DC[@]}" ps -a >"$out/compose-ps.txt" 2>&1 || true
+  docker ps -a --filter "label=com.docker.compose.project=$PROJECT" \
+    --format '{{.Names}}\t{{.Status}}\t{{.Image}}' >"$out/containers.txt" 2>&1 || true
+  "${DC[@]}" logs --no-color --timestamps --tail 300 \
+    backend outbox worker sampler redpanda victoriametrics >"$out/services-tail.log" 2>&1 || true
+  rpk_exec cluster health >"$out/rpk-cluster-health.txt" 2>&1 || true
+  rpk_exec topic list >"$out/topics.txt" 2>&1 || true
+  describe_group >"$out/group.txt"
+  {
+    echo "backlog=$(pg_scalar "SELECT count(*) FROM recap_requests WHERE status IN ('queued', 'processing')")"
+    echo "outbox_unpublished=$(pg_scalar "SELECT count(*) FROM outbox_events WHERE status <> 'published'")"
+  } >"$out/queues.txt" 2>&1 || true
+  echo "$(now) $out: $*" >>"$RESULT_DIR/steps-failed.log"
+  log "FATAL: $*"
+  log "diagnostics: $out"
+  exit 1
+}
+
+pg_scalar() {
+  "${DC[@]}" exec -T postgres psql -U avito -d avito_recap -Atc "$1" 2>/dev/null | tr -d '[:space:]'
+}
+
+# ---- pandaproxy_client.produce_batch_delay_ms: requested vs confirmed -------
+
+PRODUCE_DELAY_KEY=pandaproxy_client.produce_batch_delay_ms
+
+# Value the running broker process printed at its last start (Redpanda logs
+# every effective property at startup), e.g. "...produce_batch_delay_ms:5ms".
+redpanda_logged_delay() {
+  local id started
+  id=$(service_ids redpanda | head -n 1)
+  [ -n "$id" ] || return 0
+  started=$(docker inspect -f '{{.State.StartedAt}}' "$id")
+  docker logs --since "$started" "$id" 2>&1 |
+    grep -m 1 -o "${PRODUCE_DELAY_KEY//./\\.}:[0-9]*ms" | sed 's/.*:\([0-9]*\)ms/\1/' || true
+}
+
+# Value in the node configuration file written by `redpanda start --set`.
+redpanda_file_delay() {
+  "${DC[@]}" exec -T redpanda sh -c 'cat /etc/redpanda/redpanda.yaml' 2>/dev/null |
+    awk '/^pandaproxy_client:/ { section = 1; next } /^[^ ]/ { section = 0 }
+         section && $1 == "produce_batch_delay_ms:" { print $2; exit }' || true
+}
+
+# capture_produce_delay writes requested and confirmed values to run.env and
+# host/redpanda-config.json (included in environment.json).
+capture_produce_delay() {
+  local logged file status started
+  logged=$(redpanda_logged_delay)
+  file=$(redpanda_file_delay)
+  started=$(docker inspect -f '{{.State.StartedAt}}' "$(service_ids redpanda | head -n 1)" 2>/dev/null || true)
+  if [ -n "$logged" ] && [ "$logged" = "$BENCH_PANDAPROXY_PRODUCE_BATCH_DELAY_MS" ]; then
+    status=confirmed
+  elif [ -n "$logged" ]; then
+    status=mismatch
+  elif [ -n "$file" ] && [ "$file" = "$BENCH_PANDAPROXY_PRODUCE_BATCH_DELAY_MS" ]; then
+    status=file_only
+  else
+    status=unconfirmed
+  fi
+  PRODUCE_DELAY_STATUS=$status
+  PRODUCE_DELAY_CONFIRMED=${logged:-}
+  mkdir -p "$RESULT_DIR/host"
+  printf '{"setting":"%s","requested_ms":%s,"requested_source":"%s","confirmed_ms_from_broker_log":"%s","value_ms_in_redpanda_yaml":"%s","broker_started_at":"%s","status":"%s"}\n' \
+    "$PRODUCE_DELAY_KEY" "$BENCH_PANDAPROXY_PRODUCE_BATCH_DELAY_MS" "$PRODUCE_DELAY_SOURCE" \
+    "$logged" "$file" "$started" "$status" >"$RESULT_DIR/host/redpanda-config.json"
+  {
+    echo "PRODUCE_BATCH_DELAY_MS_REQUESTED=$BENCH_PANDAPROXY_PRODUCE_BATCH_DELAY_MS"
+    echo "PRODUCE_BATCH_DELAY_MS_SOURCE=$PRODUCE_DELAY_SOURCE"
+    echo "PRODUCE_BATCH_DELAY_MS_CONFIRMED=$logged"
+    echo "PRODUCE_BATCH_DELAY_MS_FILE=$file"
+    echo "PRODUCE_BATCH_DELAY_MS_STATUS=$status"
+  } >>"$RESULT_DIR/run.env"
+  log "$PRODUCE_DELAY_KEY: requested=$BENCH_PANDAPROXY_PRODUCE_BATCH_DELAY_MS ($PRODUCE_DELAY_SOURCE), broker log=${logged:-none}, redpanda.yaml=${file:-none} -> $status"
+}
+
+# phase_gate <label>: before a k6 phase wait for empty queues (no queued or
+# processing requests, no unpublished outbox events), a healthy broker,
+# WORKERS group members with active consumers and fresh scrape targets.
+phase_gate() {
+  local label=$1 deadline backlog outbox health cluster consumers=-1 members
+  log "phase gate before $label: empty queues, healthy broker, $WORKERS consumers, fresh targets"
+  deadline=$(($(date +%s) + ${BENCH_PHASE_GATE_WAIT_S:-600}))
+  while true; do
+    backlog=$(pg_scalar "SELECT count(*) FROM recap_requests WHERE status IN ('queued', 'processing')")
+    outbox=$(pg_scalar "SELECT count(*) FROM outbox_events WHERE status <> 'published'")
+    health=$(health_of redpanda)
+    cluster=$(rpk_exec cluster health 2>&1 | awk '$1 == "Healthy:" { print $2 }')
+    if [ "$backlog" = 0 ] && [ "$outbox" = 0 ] && [ "$health" = healthy ] && [ "$cluster" = true ]; then
+      break
+    fi
+    if [ "$(date +%s)" -ge "$deadline" ]; then
+      stand_fail "phase-gate-$label" "phase gate $label: backlog=$backlog outbox_unpublished=$outbox redpanda=$health cluster_healthy=${cluster:-unknown}"
+    fi
+    sleep 5
+  done
+  if [ "$BENCH_COMMAND_SOURCE" != "database" ]; then consumers=$WORKERS; fi
+  tools bench-verify metrics --expect "api=1,outbox=1,worker=$WORKERS,sampler=1" \
+    --expect-consumers "$consumers" --wait "${BENCH_PHASE_GATE_METRICS_WAIT:-120s}" \
+    --output "$CONTAINER_DIR/metrics-gate-$label.json" ||
+    stand_fail "phase-gate-$label" "phase gate $label: scrape targets or consumers (see metrics-gate-$label.json)"
+  if [ "$BENCH_COMMAND_SOURCE" != "database" ]; then
+    members=$(group_members)
+    [ "$members" = "$WORKERS" ] ||
+      stand_fail "phase-gate-$label" "phase gate $label: consumer group has $members members, expected $WORKERS"
+  fi
+  mark "gate_${label}_passed" >/dev/null
+  echo "PHASE_GATE_$(echo "$label" | tr '[:lower:]-' '[:upper:]_')=passed" >>"$RESULT_DIR/run.env"
+}
+
 # reuse_fail saves diagnostics of the running stand and stops the scenario
 # before seeding and k6.
 reuse_fail() {
@@ -238,6 +367,14 @@ reuse_checks() {
     reuse_fail "Redpanda HTTP Proxy redpanda:8082 is not reachable from the bench network"
   fi
   verify_topics "$RESULT_DIR"
+  # BENCH_REUSE does not restart the broker, so it cannot apply a different
+  # produce_batch_delay_ms: the running broker must already have it.
+  local logged
+  logged=$(redpanda_logged_delay)
+  if [ -z "$logged" ]; then logged=$(redpanda_file_delay); fi
+  if [ "$logged" != "$BENCH_PANDAPROXY_PRODUCE_BATCH_DELAY_MS" ]; then
+    reuse_fail "running broker has $PRODUCE_DELAY_KEY=${logged:-unknown}, requested $BENCH_PANDAPROXY_PRODUCE_BATCH_DELAY_MS; changing it needs a broker restart (run without BENCH_REUSE)"
+  fi
 }
 
 stand_down() { "${DC[@]}" --profile tools down --remove-orphans; }
@@ -376,8 +513,10 @@ prepare_run() {
   fi
 
   capture_host
+  capture_produce_delay
   step tools bench-environment --output "$CONTAINER_DIR/environment.json" \
     --vm-url http://victoriametrics:8428 \
+    --host-file "redpanda_config=$CONTAINER_DIR/host/redpanda-config.json" \
     --host-file "host=$CONTAINER_DIR/host/host.json" \
     --host-file "container_env=$CONTAINER_DIR/host/container-env.txt" \
     --host-file "images=$CONTAINER_DIR/host/images.txt"
@@ -497,6 +636,7 @@ scenario_steady() {
     echo "STEADY_USER_EVERY_S=$every"; echo "STEADY_USER_COHORT=$users"
   } >>"$RESULT_DIR/run.env"
 
+  phase_gate warmup
   mark warmup_start >/dev/null
   k6_run warmup PHASE=steady-warmup RATE="$rate" DURATION_S="$warmup" OFFSET=0
   local warm_end
@@ -505,6 +645,7 @@ scenario_steady() {
   mark warmup_drained >/dev/null
   reconcile warmup warmup
 
+  phase_gate measure
   local start end
   start=$(mark measure_start)
   k6_run measure PHASE=steady-measure RATE="$rate" DURATION_S="$duration" OFFSET="$warm_count" \

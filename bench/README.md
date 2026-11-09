@@ -312,6 +312,83 @@ Dashboards (`bench/grafana/dashboards`): «Вход и результат» и �
 
 Новые метрики не меняют поведение: та же concurrency, тот же размер пачки outbox, те же retries, порядок публикаций, commit и режим worker. Новый прогон с теми же переменными сравним с исходным по прежним рядам. В labels нет request_id, command_id и profile_id.
 
+### A/B: `pandaproxy_client.produce_batch_delay_ms` (A = 100 мс, B = 5 мс)
+
+Baseline `20261109T202942Z-steady` (20 POST/с, 3 worker, broker):
+- одна HTTP-публикация outbox в среднем занимала 102 мс, запись результата в PG — 3 мс;
+- worker делал 7 lifecycle-публикаций по 108 мс, 758 мс на попытку;
+- на выходе — около 9–10 команд/с и 3,54 ready/с.
+
+Время одной публикации практически равно умолчанию Redpanda `pandaproxy_client.produce_batch_delay_ms = 100 ms`: HTTP Proxy ждёт это время, прежде чем отправить пачку produce брокеру. Эксперимент однофакторный, меняется только эта задержка.
+
+**Параметр.** Это свойство брокера (node property, секция `pandaproxy_client` в `redpanda.yaml`). Брокер читает его только при старте. В bench Compose оно передаётся аргументами `redpanda start`: `--set pandaproxy_client.produce_batch_delay_ms=${BENCH_PANDAPROXY_PRODUCE_BATCH_DELAY_MS:-100}`. По умолчанию 100 — то же, что умолчание Redpanda, поэтому прогоны без переменной не меняются. Корневой `docker-compose.yml` не тронут.
+
+**Что остаётся неизменным:**
+- 20 POST/с, 3 worker, broker, 3 партиции;
+- acks и retries HTTP Proxy (умолчания), retries worker и outbox;
+- 7 lifecycle-событий на попытку;
+- последовательная публикация outbox пачками по `OUTBOX_BATCH_SIZE=50`;
+- Go-код обработки событий.
+
+**Перезапуск брокера.** В обычном режиме (`BENCH_REUSE` не задан) `docker compose up` видит изменённую команду и пересоздаёт контейнер `redpanda`. Workers переподключают consumers сами. `BENCH_REUSE=1` брокер не перезапускает и задержку не применяет. Если у работающего брокера значение другое, reuse останавливается до seed и пишет причину в `reuse-check/`.
+
+**Запрошенное и подтверждённое значение.** В `host/redpanda-config.json` и `environment.json` → `host.redpanda_config`, а также в `run.env` пишутся:
+- `requested_ms` и `requested_source` (`explicit` или `default`);
+- `confirmed_ms_from_broker_log` — значение, которое процесс брокера вывел в лог при последнем старте (строка `pandaproxy_client.produce_batch_delay_ms:<N>ms`);
+- `value_ms_in_redpanda_yaml` — что записал `--set`;
+- `status`: `confirmed`, `mismatch`, `file_only` или `unconfirmed`.
+
+При явно заданном значении в `summary.md` есть проверка «применён брокером»: она пройдена только при `status=confirmed`. Проверить вручную:
+
+```bash
+DC="docker compose -p avito-recap-bench -f bench/compose.bench.yml"
+$DC config | grep -n 'produce_batch_delay_ms'                       # что уйдёт в команду
+docker logs --since "$(docker inspect -f '{{.State.StartedAt}}' "$($DC ps -q redpanda)")" \
+  "$($DC ps -q redpanda)" 2>&1 | grep -o 'pandaproxy_client.produce_batch_delay_ms:[0-9]*ms'   # применено процессом
+$DC exec -T redpanda grep -n -A0 'produce_batch_delay_ms' /etc/redpanda/redpanda.yaml        # записано в конфиг
+```
+
+Если лог брокера этой строки не содержит, статус будет `file_only` или `unconfirmed`, и проверка в отчёте не пройдёт. В этом случае пришлите вывод команд выше — формат лога v26.2.2 на стенде не проверялся.
+
+**Ворота перед фазами.** В steady перед прогревом и перед измерением выполняется `phase_gate`, ожидание до `BENCH_PHASE_GATE_WAIT_S=600`:
+- в PG нет `queued`/`processing` и нет неопубликованных записей outbox;
+- контейнер `redpanda` в статусе healthy и `rpk cluster health` показывает `Healthy: true`;
+- в VictoriaMetrics свежие targets `api=1, outbox=1, worker=3, sampler=1` и 3 активных consumer;
+- в группе `recap-workers-v1` ровно 3 члена.
+
+При провале фаза k6 не стартует, exit 1, диагностика в `phase-gate-<фаза>/`. Lag Redpanda в ворота не входит: worker коммитит offset последней записи, поэтому у догнавших партиций lag 1.
+
+**Эквивалентные когорты.** Оба прогона стартуют с `BENCH_RESET=1` и одним `SEED`. Volumes пересоздаются, и bench-data генерирует те же профили и события: 1200 на прогрев, 6000 на измерение, 60 на пользовательскую когорту. Прогрев одинаковый — 60 с по 20 POST/с, затем пустые очереди. Минус в том, что `BENCH_RESET` стирает и VictoriaMetrics: графики A после старта B пропадут, а файлы отчёта A в `bench/results` останутся. Если графики нужны, снимите их до B или запускайте B без `BENCH_RESET` с другим `SEED` — когорты будут того же размера, но не идентичными.
+
+```bash
+SEED=20261110
+
+# A: 100 мс (явно, равно умолчанию Redpanda)
+BENCH_RESET=1 SEED=$SEED RUN_ID=$(date -u +%Y%m%dT%H%M%SZ)-steady-A-delay100 \
+  BENCH_PANDAPROXY_PRODUCE_BATCH_DELAY_MS=100 \
+  STEADY_RATE=20 STEADY_WARMUP_S=60 STEADY_DURATION_S=300 STEADY_USER_EVERY_S=5 \
+  WORKERS=3 BENCH_COMMAND_SOURCE=broker make bench-steady
+
+# B: 5 мс, всё остальное то же
+BENCH_RESET=1 SEED=$SEED RUN_ID=$(date -u +%Y%m%dT%H%M%SZ)-steady-B-delay5 \
+  BENCH_PANDAPROXY_PRODUCE_BATCH_DELAY_MS=5 \
+  STEADY_RATE=20 STEADY_WARMUP_S=60 STEADY_DURATION_S=300 STEADY_USER_EVERY_S=5 \
+  WORKERS=3 BENCH_COMMAND_SOURCE=broker make bench-steady
+
+# Сравнение
+for d in bench/results/*-steady-A-delay100 bench/results/*-steady-B-delay5; do
+  echo "== $d"; grep -h '^PRODUCE_BATCH_DELAY_MS\|^SEED\|^STAND_MODE' "$d/run.env"
+  grep -h 'produce_batch_delay_ms\|p95 принятия\|ready со snapshot' "$d/summary.md"
+done
+```
+
+Сравнивайте на панелях 13–17 и в `metrics-end.json` → `window_stats`:
+- среднее HTTP publish в outbox и среднюю lifecycle-публикацию;
+- lifecycle на попытку;
+- опубликованные команды/с, ready/с, backlog и возраст очереди.
+
+Для вывода о влиянии нужно минимум по три прогона на вариант в чередующемся порядке (A, B, B, A, …); один прогон даёт только направление эффекта.
+
 ### Устаревшие consumers HTTP Proxy и offset commit (разбор smoke 2026-11-09)
 
 На прогоне `20261109T175410Z-smoke` (SHA `7a31ac6`) 98 из 100 работ стали ready, 2 остались `queued` навсегда, а обработка стояла с 17:55:10 по 17:59:08. Причин две.

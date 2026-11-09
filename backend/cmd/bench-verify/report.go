@@ -253,6 +253,19 @@ func (r reportInputs) commonGates() {
 	} else {
 		r.add(categoryMeasurement, "preflight данных", strings.Join(preflight.Problems, "; "), "без замечаний", preflight.Passed)
 	}
+	if requested, ok := r.env["PRODUCE_BATCH_DELAY_MS_REQUESTED"]; ok {
+		// Requested (bench env) vs confirmed (value printed by the running
+		// broker at its last start). A default run only reports the values.
+		value := fmt.Sprintf("requested=%s (%s), broker log=%s, redpanda.yaml=%s, status=%s",
+			requested, r.env["PRODUCE_BATCH_DELAY_MS_SOURCE"], valueOr(r.env["PRODUCE_BATCH_DELAY_MS_CONFIRMED"], "нет"),
+			valueOr(r.env["PRODUCE_BATCH_DELAY_MS_FILE"], "нет"), r.env["PRODUCE_BATCH_DELAY_MS_STATUS"])
+		if r.env["PRODUCE_BATCH_DELAY_MS_SOURCE"] == "explicit" {
+			r.add(categoryConfig, "pandaproxy_client.produce_batch_delay_ms применён брокером", value,
+				"подтверждён логом брокера = "+requested, r.env["PRODUCE_BATCH_DELAY_MS_STATUS"] == "confirmed")
+		} else {
+			r.section("Redpanda HTTP Proxy", "- pandaproxy_client.produce_batch_delay_ms: "+value)
+		}
+	}
 	if members, ok := r.env["GROUP_MEMBERS_START"]; ok {
 		// Stale HTTP Proxy consumers hold partitions until they expire; a run
 		// started with them measures the stale member, not the stand.
@@ -701,7 +714,8 @@ func renderReport(data *reportData) string {
 		fmt.Fprintf(&builder, "- Отсутствуют обязательные файлы: %s\n", strings.Join(data.Missing, ", "))
 	}
 	builder.WriteString("\n## Параметры запуска\n\n")
-	for _, key := range []string{"RUN_ID", "SCENARIO", "STAND_MODE", "TESTID", "SEED", "PROFILES", "EVENTS_PER_PROFILE", "YEAR", "COMMAND_SOURCE", "WORKERS", "NARRATIVE_PROVIDER", "WORKER_RETRY_BASE", "WORKER_RETRY_MAX", "WORKER_MAX_ATTEMPTS", "WORKER_LEASE_DURATION", "WORKER_HEARTBEAT_INTERVAL", "GIT_SHA"} {
+	for _, key := range []string{"RUN_ID", "SCENARIO", "STAND_MODE", "TESTID", "SEED", "PROFILES", "EVENTS_PER_PROFILE", "YEAR", "COMMAND_SOURCE", "WORKERS", "NARRATIVE_PROVIDER", "WORKER_RETRY_BASE", "WORKER_RETRY_MAX", "WORKER_MAX_ATTEMPTS", "WORKER_LEASE_DURATION", "WORKER_HEARTBEAT_INTERVAL",
+		"PRODUCE_BATCH_DELAY_MS_REQUESTED", "PRODUCE_BATCH_DELAY_MS_CONFIRMED", "PRODUCE_BATCH_DELAY_MS_STATUS", "GIT_SHA"} {
 		if value, ok := data.Env[key]; ok {
 			fmt.Fprintf(&builder, "- %s: `%s`\n", key, value)
 		}
@@ -742,6 +756,13 @@ func renderReport(data *reportData) string {
 	builder.WriteString("- `metrics-*.json` — targets, ряды k6, режим narrative, серверные показатели окна\n")
 	builder.WriteString("- `phases.log` — UTC-границы фаз; `docker-stats.jsonl` — CPU/память контейнеров; `logs/` — логи сервисов\n")
 	return builder.String()
+}
+
+func valueOr(value, fallback string) string {
+	if value == "" {
+		return fallback
+	}
+	return value
 }
 
 // drainValue describes a drain wait; an unfinished drain has no duration.
