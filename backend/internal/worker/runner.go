@@ -14,6 +14,7 @@ import (
 	recap "recap-personalization/internal/recap"
 	"recap-personalization/internal/repository"
 	"recap-personalization/internal/service"
+	"recap-personalization/internal/telemetry"
 )
 
 type Queue interface {
@@ -86,6 +87,7 @@ func (r *Runner) RunMaintenance(ctx context.Context) error {
 		if failed, err := r.queue.FailExpiredExhaustedRecapRequests(ctx); err != nil {
 			log.Printf("worker %s failed to sweep expired requests: %v", r.config.WorkerID, err)
 		} else if failed > 0 {
+			telemetry.WorkerExpiredLeaseFailed.Add(float64(failed))
 			log.Printf("worker %s marked %d exhausted requests failed", r.config.WorkerID, failed)
 		}
 		if !sleepContext(ctx, r.config.PollInterval) {
@@ -105,7 +107,7 @@ func (r *Runner) ProcessNext(ctx context.Context) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	r.logClaim(request)
+	r.logClaim(request, telemetry.ClaimSourceDatabase)
 	r.publishLifecycle(ctx, request, model.RecapRequestProcessing, "starting", 5)
 	_, processErr := r.processClaimed(ctx, request)
 	return true, processErr
@@ -136,12 +138,21 @@ func (r *Runner) ProcessRequestByID(ctx context.Context, requestID string) (bool
 	if err != nil {
 		return false, err
 	}
-	r.logClaim(request)
+	r.logClaim(request, telemetry.ClaimSourceBroker)
 	r.publishLifecycle(ctx, request, model.RecapRequestProcessing, "starting", 5)
 	return r.processClaimed(ctx, request)
 }
 
-func (r *Runner) logClaim(request *model.RecapRequest) {
+// EffectiveConfig returns the configuration after defaults and normalization.
+func (r *Runner) EffectiveConfig() Config {
+	return r.config
+}
+
+func (r *Runner) logClaim(request *model.RecapRequest, source string) {
+	telemetry.WorkerClaims.Inc(source)
+	if wait := time.Since(request.AvailableAt); wait >= 0 {
+		telemetry.WorkerQueueWait.Observe(wait.Seconds(), source)
+	}
 	log.Printf(
 		"worker %s claimed recap request %s (attempt %d/%d)",
 		r.config.WorkerID,
@@ -152,8 +163,18 @@ func (r *Runner) logClaim(request *model.RecapRequest) {
 }
 
 func (r *Runner) processClaimed(parent context.Context, request *model.RecapRequest) (bool, error) {
+	handled, result, err := r.processClaimedAttempt(parent, request)
+	telemetry.WorkerAttemptResults.Inc(result)
+	return handled, err
+}
+
+func (r *Runner) processClaimedAttempt(parent context.Context, request *model.RecapRequest) (bool, string, error) {
 	processCtx, cancel := context.WithCancel(parent)
 	defer cancel()
+
+	attemptStarted := time.Now()
+	telemetry.WorkerBusy.Set(1)
+	defer telemetry.WorkerBusy.Set(0)
 
 	heartbeatStopped := make(chan struct{})
 	heartbeatResult := make(chan error, 1)
@@ -169,22 +190,23 @@ func (r *Runner) processClaimed(parent context.Context, request *model.RecapRequ
 	err := r.processor.ProcessRecapRequest(processCtx, request, r.config.WorkerID)
 	close(heartbeatStopped)
 	leaseErr := <-heartbeatResult
+	telemetry.WorkerStageDuration.Observe(time.Since(attemptStarted).Seconds(), telemetry.StageAttempt)
 	if leaseErr != nil {
 		log.Printf("worker %s lost lease for request %s: %v", r.config.WorkerID, request.ID, leaseErr)
 		if errors.Is(leaseErr, repository.ErrRecapRequestLeaseLost) {
-			return false, nil
+			return false, telemetry.AttemptLeaseLost, nil
 		}
-		return false, leaseErr
+		return false, telemetry.AttemptStateError, leaseErr
 	}
 
 	if err == nil {
 		r.publishLifecycle(parent, request, model.RecapRequestReady, "ready", 100)
 		log.Printf("worker %s completed recap request %s", r.config.WorkerID, request.ID)
-		return true, nil
+		return true, telemetry.AttemptReady, nil
 	}
 	if errors.Is(err, repository.ErrRecapRequestLeaseLost) {
 		log.Printf("worker %s cannot finalize stale request %s", r.config.WorkerID, request.ID)
-		return false, nil
+		return false, telemetry.AttemptLeaseLost, nil
 	}
 
 	code, retryable := classifyError(err)
@@ -194,6 +216,7 @@ func (r *Runner) processClaimed(parent context.Context, request *model.RecapRequ
 		code = "worker_shutdown"
 		retryable = true
 	}
+	telemetry.WorkerFailures.Inc(code)
 
 	operationCtx, operationCancel := context.WithTimeout(context.Background(), r.config.ShutdownTimeout)
 	defer operationCancel()
@@ -210,13 +233,14 @@ func (r *Runner) processClaimed(parent context.Context, request *model.RecapRequ
 		); requeueErr != nil {
 			log.Printf("worker %s failed to requeue request %s: %v", r.config.WorkerID, request.ID, requeueErr)
 			if errors.Is(requeueErr, repository.ErrRecapRequestLeaseLost) {
-				return false, nil
+				return false, telemetry.AttemptLeaseLost, nil
 			}
-			return false, requeueErr
+			return false, telemetry.AttemptStateError, requeueErr
 		}
+		telemetry.WorkerRetryDelay.Observe(delay.Seconds())
 		r.publishLifecycle(operationCtx, request, model.RecapRequestQueued, "queued", 0)
 		log.Printf("worker %s requeued request %s after %s: %v", r.config.WorkerID, request.ID, delay, err)
-		return true, nil
+		return true, telemetry.AttemptRequeued, nil
 	}
 
 	if markErr := r.queue.MarkRecapRequestFailed(
@@ -229,16 +253,18 @@ func (r *Runner) processClaimed(parent context.Context, request *model.RecapRequ
 	); markErr != nil {
 		log.Printf("worker %s failed to mark request %s failed: %v", r.config.WorkerID, request.ID, markErr)
 		if errors.Is(markErr, repository.ErrRecapRequestLeaseLost) {
-			return false, nil
+			return false, telemetry.AttemptLeaseLost, nil
 		}
-		return false, markErr
+		return false, telemetry.AttemptStateError, markErr
 	}
 	r.publishLifecycle(operationCtx, request, model.RecapRequestFailed, "failed", request.ProgressPercent)
+	result := telemetry.AttemptFailedTerminal
 	if retryable && request.AttemptCount >= request.MaxAttempts {
+		result = telemetry.AttemptFailedExhausted
 		r.publishDLQ(operationCtx, request, code, message)
 	}
 	log.Printf("worker %s marked request %s failed: %v", r.config.WorkerID, request.ID, err)
-	return true, nil
+	return true, result, nil
 }
 
 func (r *Runner) publishLifecycle(
@@ -253,8 +279,11 @@ func (r *Runner) publishLifecycle(
 	}
 	event := eventing.NewLifecycle(request.ID, status, stage, progress, request.AttemptCount)
 	if err := r.publisher.PublishLifecycle(ctx, event); err != nil {
+		telemetry.EventPublishes.Inc("lifecycle", "error")
 		log.Printf("worker %s failed to publish lifecycle event for %s: %v", r.config.WorkerID, request.ID, err)
+		return
 	}
+	telemetry.EventPublishes.Inc("lifecycle", "ok")
 }
 
 func (r *Runner) publishDLQ(ctx context.Context, request *model.RecapRequest, code, message string) {
@@ -271,8 +300,11 @@ func (r *Runner) publishDLQ(ctx context.Context, request *model.RecapRequest, co
 		FailedAt:     time.Now().UTC(),
 	}
 	if err := r.publisher.PublishFailedCommand(ctx, event); err != nil {
+		telemetry.EventPublishes.Inc("dlq", "error")
 		log.Printf("worker %s failed to publish DLQ event for %s: %v", r.config.WorkerID, request.ID, err)
+		return
 	}
+	telemetry.EventPublishes.Inc("dlq", "ok")
 }
 
 func (r *Runner) maintainLease(

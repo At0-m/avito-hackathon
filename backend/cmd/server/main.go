@@ -18,6 +18,7 @@ import (
 	"recap-personalization/internal/recap/pipeline"
 	"recap-personalization/internal/repository"
 	"recap-personalization/internal/service"
+	"recap-personalization/internal/telemetry"
 	"recap-personalization/pkg/database"
 )
 
@@ -44,8 +45,12 @@ func main() {
 	}
 	cancelPing()
 
+	narrativeMode, err := cfg.NarrativeProviderMode()
+	if err != nil {
+		log.Fatal(err)
+	}
 	var provider narrative.Provider
-	if cfg.MistralAPIKey != "" {
+	if narrativeMode == config.NarrativeProviderMistral {
 		provider = narrative.MistralHTTPProvider{
 			APIKey:   cfg.MistralAPIKey,
 			Model:    cfg.MistralModel,
@@ -53,6 +58,8 @@ func main() {
 			Timeout:  cfg.MistralTimeout,
 		}
 	}
+	log.Printf("narrative provider mode: %s", narrativeMode)
+	telemetry.NarrativeProviderMode.Set(1, narrativeMode)
 	generator := pipeline.NewGenerator(provider)
 	for _, host := range cfg.PublicAvatarHosts {
 		generator.Registry.PublicAvatarHosts[host] = struct{}{}
@@ -72,6 +79,16 @@ func main() {
 
 	router := gin.New()
 	router.Use(gin.Logger(), gin.Recovery())
+	if cfg.MetricsAddr != "" {
+		// Metrics are served on a separate listener; the public API on
+		// SERVER_PORT is unchanged.
+		router.Use(handler.MetricsMiddleware())
+		telemetry.Default.RegisterDBStats("postgres", postgres.DB)
+		telemetry.ConfigValue.Set(float64(cfg.WorkerMaxAttempts), "api_max_attempts")
+		telemetry.SetConfigSeconds("api_poll_after_seconds", cfg.RecapPollAfter.Seconds())
+		telemetry.SetConfigSeconds("sse_poll_interval_seconds", cfg.SSEPollInterval.Seconds())
+		telemetry.StartServer(context.Background(), cfg.MetricsAddr)
+	}
 	appHandler.RegisterRoutes(router)
 
 	server := &http.Server{

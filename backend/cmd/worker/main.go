@@ -17,6 +17,7 @@ import (
 	"recap-personalization/internal/recap/pipeline"
 	"recap-personalization/internal/repository"
 	"recap-personalization/internal/service"
+	"recap-personalization/internal/telemetry"
 	"recap-personalization/internal/worker"
 	"recap-personalization/pkg/database"
 )
@@ -44,8 +45,12 @@ func main() {
 	}
 	cancelPing()
 
+	narrativeMode, err := cfg.NarrativeProviderMode()
+	if err != nil {
+		log.Fatal(err)
+	}
 	var provider narrative.Provider
-	if cfg.MistralAPIKey != "" {
+	if narrativeMode == config.NarrativeProviderMistral {
 		provider = narrative.MistralHTTPProvider{
 			APIKey:   cfg.MistralAPIKey,
 			Model:    cfg.MistralModel,
@@ -53,6 +58,8 @@ func main() {
 			Timeout:  cfg.MistralTimeout,
 		}
 	}
+	log.Printf("narrative provider mode: %s", narrativeMode)
+	telemetry.NarrativeProviderMode.Set(1, narrativeMode)
 	generator := pipeline.NewGenerator(provider)
 	for _, host := range cfg.PublicAvatarHosts {
 		generator.Registry.PublicAvatarHosts[host] = struct{}{}
@@ -88,6 +95,10 @@ func main() {
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+
+	recordWorkerConfig(cfg, runner.EffectiveConfig())
+	telemetry.Default.RegisterDBStats("postgres", postgres.DB)
+	telemetry.StartServer(ctx, cfg.MetricsAddr)
 
 	errCh := make(chan error, 3)
 	go func() { errCh <- runner.RunMaintenance(ctx) }()
@@ -135,11 +146,12 @@ func runBrokerCommands(
 			Name:            workerID + "-" + uuid.NewString()[:8],
 			Topics:          []string{cfg.RedpandaCommandTopic},
 			AutoOffsetReset: "earliest",
-			RequestTimeout:  10 * time.Second,
+			RequestTimeout:  brokerConsumerReqTimeout,
 		})
 		if err != nil {
+			telemetry.BrokerConsumerRestarts.Inc("create_failed")
 			log.Printf("create Redpanda command consumer: %v", err)
-			if !sleep(ctx, time.Second) {
+			if !sleep(ctx, brokerErrorBackoff) {
 				return nil
 			}
 			continue
@@ -150,13 +162,21 @@ func runBrokerCommands(
 			dispatcher,
 			publisher,
 			cfg.RedpandaConsumerGroup,
-			time.Second,
+			brokerPollTimeout,
 		)
-		if err := commandRunner.Run(ctx); err != nil && ctx.Err() == nil {
-			delay := time.Second
+		telemetry.BrokerConsumerActive.Set(1)
+		err = commandRunner.Run(ctx)
+		telemetry.BrokerConsumerActive.Set(0)
+		if err != nil && ctx.Err() == nil {
+			delay := brokerErrorBackoff
 			if errors.Is(err, worker.ErrCommandDeferred) {
-				delay = 250 * time.Millisecond
+				// The command targets a request with an active lease elsewhere
+				// (or a not yet due retry): the consumer is recreated and the
+				// uncommitted record is redelivered until the claim succeeds.
+				delay = brokerDeferredBackoff
+				telemetry.BrokerConsumerRestarts.Inc("deferred")
 			} else {
+				telemetry.BrokerConsumerRestarts.Inc("error")
 				log.Printf("Redpanda command consumer stopped: %v", err)
 			}
 			if !sleep(ctx, delay) {
@@ -166,6 +186,44 @@ func runBrokerCommands(
 		}
 		return nil
 	}
+}
+
+// Fixed reconnect delays of the Redpanda command consumer. They are not
+// configurable; the effective values are exported via recap_config_value.
+const (
+	brokerErrorBackoff       = time.Second
+	brokerDeferredBackoff    = 250 * time.Millisecond
+	brokerPollTimeout        = time.Second
+	brokerConsumerReqTimeout = 10 * time.Second
+)
+
+func recordWorkerConfig(cfg config.Config, effective worker.Config) {
+	telemetry.SetConfigSeconds("worker_poll_interval_seconds", effective.PollInterval.Seconds())
+	telemetry.SetConfigSeconds("worker_lease_duration_seconds", effective.LeaseDuration.Seconds())
+	telemetry.SetConfigSeconds("worker_heartbeat_interval_seconds", effective.Heartbeat.Seconds())
+	telemetry.SetConfigSeconds("worker_retry_base_seconds", effective.RetryBase.Seconds())
+	telemetry.SetConfigSeconds("worker_retry_max_seconds", effective.RetryMax.Seconds())
+	telemetry.SetConfigSeconds("worker_shutdown_timeout_seconds", effective.ShutdownTimeout.Seconds())
+	// max_attempts is stamped on each request by the API at creation time;
+	// this value only matters for requests created with the worker's config.
+	telemetry.ConfigValue.Set(float64(cfg.WorkerMaxAttempts), "worker_max_attempts")
+	telemetry.SetConfigSeconds("mistral_timeout_seconds", cfg.MistralTimeout.Seconds())
+	telemetry.SetConfigSeconds("redpanda_http_timeout_seconds", cfg.RedpandaHTTPTimeout.Seconds())
+	telemetry.SetConfigSeconds("broker_error_backoff_seconds", brokerErrorBackoff.Seconds())
+	telemetry.SetConfigSeconds("broker_deferred_backoff_seconds", brokerDeferredBackoff.Seconds())
+	telemetry.SetConfigSeconds("broker_poll_timeout_seconds", brokerPollTimeout.Seconds())
+	telemetry.SetConfigSeconds("broker_consumer_request_timeout_seconds", brokerConsumerReqTimeout.Seconds())
+	source := 0.0
+	switch cfg.WorkerCommandSource {
+	case "database":
+		source = 1
+	case "broker":
+		source = 2
+	case "hybrid":
+		source = 3
+	}
+	// 1=database, 2=broker, 3=hybrid.
+	telemetry.ConfigValue.Set(source, "worker_command_source")
 }
 
 func sleep(ctx context.Context, duration time.Duration) bool {

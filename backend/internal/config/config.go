@@ -40,6 +40,41 @@ type Config struct {
 	OutboxBatchSize        int
 	SSEPollInterval        time.Duration
 	SSEHeartbeatInterval   time.Duration
+	// NarrativeProvider selects the narrative source: "auto" (default; Mistral
+	// when MISTRAL_API_KEY is set, otherwise the template), "disabled" (always
+	// the template, the key is ignored) or "mistral" (requires the key).
+	NarrativeProvider string
+	// MetricsAddr enables the Prometheus endpoint on a separate listener,
+	// for example ":9100". Empty disables it.
+	MetricsAddr string
+}
+
+const (
+	NarrativeProviderAuto     = "auto"
+	NarrativeProviderDisabled = "disabled"
+	NarrativeProviderMistral  = "mistral"
+)
+
+// NarrativeProviderMode resolves the effective narrative provider. It returns
+// NarrativeProviderDisabled or NarrativeProviderMistral.
+func (c Config) NarrativeProviderMode() (string, error) {
+	hasKey := strings.TrimSpace(c.MistralAPIKey) != ""
+	switch strings.ToLower(strings.TrimSpace(c.NarrativeProvider)) {
+	case "", NarrativeProviderAuto:
+		if hasKey {
+			return NarrativeProviderMistral, nil
+		}
+		return NarrativeProviderDisabled, nil
+	case NarrativeProviderDisabled, "template", "off", "none":
+		return NarrativeProviderDisabled, nil
+	case NarrativeProviderMistral:
+		if !hasKey {
+			return "", fmt.Errorf("NARRATIVE_PROVIDER=mistral requires MISTRAL_API_KEY")
+		}
+		return NarrativeProviderMistral, nil
+	default:
+		return "", fmt.Errorf("unsupported NARRATIVE_PROVIDER %q: expected auto, disabled or mistral", c.NarrativeProvider)
+	}
 }
 
 func Load() Config {
@@ -75,6 +110,8 @@ func Load() Config {
 		OutboxBatchSize:        intEnv("OUTBOX_BATCH_SIZE", 50),
 		SSEPollInterval:        durationEnv("SSE_POLL_INTERVAL", 250*time.Millisecond),
 		SSEHeartbeatInterval:   durationEnv("SSE_HEARTBEAT_INTERVAL", 10*time.Second),
+		NarrativeProvider:      env("NARRATIVE_PROVIDER", NarrativeProviderAuto),
+		MetricsAddr:            strings.TrimSpace(os.Getenv("METRICS_ADDR")),
 	}
 }
 

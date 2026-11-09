@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"testing"
+
+	"recap-personalization/internal/telemetry"
 )
 
 type fakeProvider struct {
@@ -55,6 +57,37 @@ func TestServiceFallsBackOnUnsupportedNumberURLAndProviderError(t *testing.T) {
 		if got.SummaryTitle != "Твой город за год" {
 			t.Fatalf("case %d title=%q", i, got.SummaryTitle)
 		}
+	}
+}
+
+func TestNarrativeOutcomesSeparateDisabledProviderFromFallback(t *testing.T) {
+	outcome := func(name string) float64 { return telemetry.NarrativeOutcomes.Value(name) }
+	calls := func() float64 { return telemetry.NarrativeProviderCalls.Value() }
+
+	disabledBefore := outcome(telemetry.NarrativeProviderDisabled)
+	callsBefore := calls()
+	got := (Service{}).Build(context.Background(), baseInput(), "")
+	if got.Source != "template" {
+		t.Fatalf("disabled provider source=%q", got.Source)
+	}
+	if outcome(telemetry.NarrativeProviderDisabled) != disabledBefore+1 {
+		t.Fatal("disabled provider must be counted as provider_disabled")
+	}
+	if calls() != callsBefore {
+		t.Fatal("disabled provider must not count provider calls")
+	}
+
+	errorBefore := outcome(telemetry.NarrativeFallbackProviderErr)
+	provider := &fakeProvider{err: errors.New("timeout")}
+	got = (Service{Provider: provider}).Build(context.Background(), baseInput(), "")
+	if got.Source != "template" || provider.calls != 1 {
+		t.Fatalf("source=%q calls=%d", got.Source, provider.calls)
+	}
+	if outcome(telemetry.NarrativeFallbackProviderErr) != errorBefore+1 {
+		t.Fatal("provider error must be counted as fallback_provider_error")
+	}
+	if calls() != callsBefore+1 {
+		t.Fatal("enabled provider call must be counted")
 	}
 }
 

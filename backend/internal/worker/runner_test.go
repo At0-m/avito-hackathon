@@ -265,6 +265,54 @@ func TestRetryDelayIsExponentialAndCapped(t *testing.T) {
 	}
 }
 
+type delayRecordingQueue struct {
+	fakeQueue
+	delays []time.Duration
+}
+
+func (q *delayRecordingQueue) RequeueRecapRequest(_ context.Context, _, _ string, delay time.Duration, _, _ string) error {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	q.delays = append(q.delays, delay)
+	return nil
+}
+
+// With max_attempts=3 only attempts 1 and 2 are requeued, so the reachable
+// backoffs are base and 2*base; the cap is never reached.
+func TestReachableRetryDelaysWithThreeAttempts(t *testing.T) {
+	cases := []struct {
+		name string
+		base time.Duration
+		max  time.Duration
+		want []time.Duration
+	}{
+		{name: "compose defaults", base: 2 * time.Second, max: 30 * time.Second, want: []time.Duration{2 * time.Second, 4 * time.Second}},
+		{name: "bench profile", base: 250 * time.Millisecond, max: time.Second, want: []time.Duration{250 * time.Millisecond, 500 * time.Millisecond}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			queue := &delayRecordingQueue{}
+			runner := NewRunner(queue, processorFunc(func(context.Context, *model.RecapRequest, string) error {
+				return service.ErrActivitySourceUnavailable
+			}), Config{WorkerID: "test", RetryBase: tc.base, RetryMax: tc.max})
+			for attempt := 1; attempt <= 3; attempt++ {
+				runner.processClaimed(context.Background(), testRequest(attempt, 3))
+			}
+			if len(queue.delays) != len(tc.want) {
+				t.Fatalf("delays=%v, want %v", queue.delays, tc.want)
+			}
+			for index := range tc.want {
+				if queue.delays[index] != tc.want[index] {
+					t.Fatalf("delays=%v, want %v", queue.delays, tc.want)
+				}
+			}
+			if !queue.failed || !queue.failedRetry {
+				t.Fatal("third attempt must be marked failed and retryable")
+			}
+		})
+	}
+}
+
 func TestNormalizeConfigKeepsHeartbeatBelowLease(t *testing.T) {
 	value := normalizeConfig(Config{
 		WorkerID:      "test",
